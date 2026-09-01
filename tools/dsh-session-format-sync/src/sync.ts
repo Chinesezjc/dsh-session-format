@@ -25,6 +25,21 @@ const FILE_STORE_IMPORT_NEW = "import { writeFileAtomicDurable } from './atomic-
 /** Package directory of session-format inside the deepseek-harness tree. */
 const SOURCE_PACKAGE_REL = join('packages', 'session', 'session-format')
 
+/**
+ * Files the standalone repo owns and a sync must not overwrite: local
+ * optimizations and behavior changes that the deepseek-harness tree does not
+ * carry yet (the O(1) append fast path and its commit/validation support).
+ * Extract preserves these files across the recursive copy so a sync cannot
+ * silently roll the standalone work back; drop a path from this list once the
+ * source tree carries the same change.
+ */
+const EXTERNAL_OWNED = [
+  'src/repository.ts',
+  'src/engine.ts',
+  'tests/repository.spec.ts',
+  'tests/engine.spec.ts',
+]
+
 export interface SyncOptions {
   /** deepseek-harness checkout root (source of truth). */
   source: string
@@ -32,14 +47,29 @@ export interface SyncOptions {
   target: string
 }
 
-/** Copy the current session-format content from source into target. */
+/** Copy the current session-format content from source into target.
+ * Standalone-owned files are preserved across the copy and restored
+ * afterwards, so the local fast path and its tests survive a sync.
+ */
 export async function extract({ source, target }: SyncOptions): Promise<string[]> {
   const from = resolve(source, SOURCE_PACKAGE_REL)
   const entries = ['src', 'tests', 'README.md', 'README.zh.md', 'README.i18n.yaml']
+  const owned = new Map<string, string>()
+  for (const rel of EXTERNAL_OWNED) {
+    try {
+      owned.set(rel, await readFile(join(target, rel), 'utf8'))
+    } catch {
+      // A missing owned file (first sync into a fresh checkout) is fine:
+      // there is nothing to preserve yet.
+    }
+  }
   const copied: string[] = []
   for (const entry of entries) {
     await cp(join(from, entry), join(target, entry), { recursive: true, force: true })
     copied.push(entry)
+  }
+  for (const [rel, content] of owned) {
+    await writeFile(join(target, rel), content)
   }
   return copied
 }
