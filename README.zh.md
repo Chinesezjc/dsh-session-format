@@ -87,8 +87,8 @@ kind: "package-library"
 
 - **仅内存原型** —— 内存 B+Tree 尚未由单一 durable 多页文件格式支撑；`DiskPageStore` 改为目录下每页一个文件持久化。
 - **仓库基于内存存储** —— `SessionRepository` 通过 `SessionFormatEngine` 组合内存 `PageStore`/`SessionStore`；接入 durable `file-store.ts` 快照延期。`DiskPageStore` 与 `DiskSessionStore` 与 `PageStore`/`SessionStore` 接口可直接互换，引擎与仓库现在即可跑在磁盘页与磁盘记录之上；durable `file-store.ts` 快照容器与共享 store 后端仍延期。
-- **append 线性扫描 id** —— `append` 扫描事件列表与 blob map 以推进事件计数器与 blob watermark，且每次提交都会重读当前 blob map 与全部滚动备份的 blob map 以校验不可变性，无界 session 的每次追加为 O(n)；持久化计数器或索引延期。
-- **底层提交点信任调用方** —— 直接调用 `engine.commitSession`/`engine.compact` 可传入降低的 blob watermark 或上限 revision；仓库路径总是派生递增值，未来变更可能在提交点统一强制。
+- **append 以 O(1) 分配 id，但提交仍重写整个快照** —— `append` 从持久化高水位（`nextEventCounter`、`blobIdWatermark`）铸造 EventId/BlobId；`createSession` 在注册时把水位校准越过文件中可见的全部 id，提交点强制校验（`validateSessionFile` 拒绝计数器或水位低于自身 id 的记录），逐次调用的 id 扫描已消除。提交改用调用方传入的内存前代检查 blob 不可变性，仅当前代映射已不持有的 id 惰性读取保留的备份页，逐次提交的备份重读也已消除。提交仍重写整个快照（多页树各页、整张 blob map 页与序列化→反序列化校验往返），无界 session 的每次追加仍因快照写入为 O(n)；增量页持久化延期。
+- **底层提交点派生递增值** —— 直接调用 `engine.commitSession`/`engine.compact` 必须提供严格推进的 revision 与越过文件自身 blob id 的 watermark（两者均在提交点强制）；仓库路径总是派生递增值，提交拒绝降低的计数器或低于 blob map 的 watermark，而不是信任调用方。
 - **存储契约仅限 JSDoc** —— 页/blob 不可变、create-only 写入与 CAS 铸造 revision 都是接口契约，尚无后端实现，也没有按 revision 固定的读取句柄来防止并发 GC 回收页。
 - **append 信任 EventId 计数器** —— `append` 跳过唯一性扫描（系统计数器铸造唯一 id）；`replaceRange` 与 `remove` 会在当前血统内退役被移除的 id，使替换永远无法复用一个仍被旧根（或滚动备份）解析的 id，而直接 `insert` 调用则在入口校验不变量。
 

@@ -32,37 +32,20 @@ export type NewSessionFile = Omit<SessionFile, 'session'> & {
 /**
  * Next EventId for a session: the persisted `nextEventCounter` is minted as
  * the suffix (the first minted id equals the counter, which the commit then
- * advances), advanced past every larger trailing numeric counter seen in the
- * session's events or in any recorded compaction's shadowed EventIds.
- * Compaction summaries persist every shadowed id and the record persists the
- * advanced counter, so the counter never regresses after a compaction removes
- * the current maximum.
+ * advances). The counter is trusted without scanning the event list or the
+ * compaction summaries: `createSession` calibrates it past every trailing
+ * numeric counter seen in the file (including foreign-prefix tails) at
+ * registration, compaction derives the next counter from the replacement
+ * ids it validates, and `validateSessionFile` rejects any record whose
+ * counter does not exceed the session's own highest used tail, so a
+ * repository-managed session's counter is always the authoritative
+ * high-water mark. This keeps append O(1) instead of scanning the file.
  * @param file - the current session file.
  * @param sessionId - the session the new event belongs to.
  * @returns the minted EventId and the numeric counter it carries.
  */
 function nextEventId(file: SessionFile, sessionId: SessionId): { id: EventId; counter: number } {
-  let counter = file.session.nextEventCounter
-  const consider = (id: EventId): void => {
-    const match = /_(\d+)$/.exec(id)
-    if (match !== null) {
-      const value = Number(match[1])
-      // Registration rejects a file whose entries carry an unsafe or ceiling
-      // numeric part, so this guard is defensive only.
-      /* v8 ignore next 3 -- unreachable via repository-managed sessions */
-      if (!Number.isSafeInteger(value) || value >= Number.MAX_SAFE_INTEGER) {
-        throw new Error(`event counter ${match[1]} exceeds the safe integer range`)
-      }
-      // A registered file's counter always exceeds every entry, so the
-      // monotonic advance is defensive for imported sparseness only.
-      /* v8 ignore next 1 -- unreachable via registered sessions */
-      if (value >= counter) counter = value + 1
-    }
-  }
-  for (const entry of file.entries) consider(entry.eventId)
-  for (const summary of file.compacted) {
-    for (const id of summary.shadowedIds) consider(id)
-  }
+  const counter = file.session.nextEventCounter
   if (counter >= Number.MAX_SAFE_INTEGER) {
     throw new Error('event counter cannot advance within the safe integer range')
   }
@@ -81,26 +64,65 @@ function blobNumeric(id: BlobId): number | undefined {
 }
 
 /**
- * Next BlobId for a session: one above the persisted watermark and every
- * numeric id in the blob map, so a payload dropped by a compaction is never
- * reassigned to different bytes.
+ * Next BlobId for a session: one above the persisted watermark. The watermark
+ * is trusted without scanning the blob map: `createSession` calibrates it
+ * past every numeric id in the map at registration, compaction advances it
+ * past the replacement blobs it validates, and the commit path rejects a blob
+ * rewrite, so a repository-managed session's watermark is always above every
+ * id the session has used. A payload dropped by a compaction is never
+ * reassigned to different bytes: a consumer holding the id across generations
+ * always resolves the same immutable payload. This keeps append O(1) instead
+ * of scanning the map.
  * @param file - the current session file.
  * @returns a BlobId above every id the session has used.
  */
 function nextBlobId(file: SessionFile): BlobId {
-  // Allocation is monotonic over the persisted watermark and the ids present,
-  // so a blob id is never reassigned to different bytes after its payload was
-  // dropped by a compaction: a consumer holding the id across generations
-  // always resolves the same immutable payload.
-  let next = file.session.blobIdWatermark ?? -1
-  for (const id of file.blobs.keys()) {
-    const value = blobNumeric(id)
-    if (value !== undefined && value > next) next = value
-  }
+  const next = file.session.blobIdWatermark ?? -1
   if (next >= Number.MAX_SAFE_INTEGER) {
     throw new Error('session blob counter cannot advance within the safe integer range')
   }
   return `blob_${next + 1}` as BlobId
+}
+
+/**
+ * Calibrate the persisted event counter and blob watermark past every id
+ * visible in a file at registration. This reproduces the scan the append
+ * path used to perform, moved to the one-time boundary so appends can trust
+ * the high-water marks in O(1): the counter is advanced past every trailing
+ * numeric counter of the entries, the shadowed ids of every recorded
+ * compaction summary, and the retired ids of the binding table (including
+ * foreign-prefix tails, matching the removed scan); the blob watermark is
+ * advanced past every canonical numeric blob id in the map. Safe-integer
+ * tails that cannot advance are rejected exactly as the scan did.
+ * @param file - the session file being registered.
+ * @returns the calibrated counter and watermark; the watermark is undefined
+ * when the file carries no numeric blob id and no caller-supplied value.
+ */
+function calibrateHighWatermarks(file: NewSessionFile): { nextEventCounter: number; blobIdWatermark?: number } {
+  let counter = file.session.nextEventCounter
+  const considerCounter = (id: string): void => {
+    const match = /_(\d+)$/.exec(id)
+    if (match === null) return
+    const value = Number(match[1])
+    if (!Number.isSafeInteger(value) || value >= Number.MAX_SAFE_INTEGER) {
+      throw new Error(`event counter ${match[1]} exceeds the safe integer range`)
+    }
+    if (value >= counter) counter = value + 1
+  }
+  for (const entry of file.entries) considerCounter(entry.eventId)
+  for (const summary of file.compacted) {
+    for (const id of summary.shadowedIds) considerCounter(id)
+  }
+  for (const eventId of file.session.usedEventBindings?.keys() ?? []) considerCounter(eventId)
+  let watermark = file.session.blobIdWatermark ?? -1
+  for (const id of file.blobs.keys()) {
+    const value = blobNumeric(id)
+    if (value !== undefined && value > watermark) watermark = value
+  }
+  return {
+    nextEventCounter: counter,
+    ...(watermark < 0 ? {} : { blobIdWatermark: watermark }),
+  }
 }
 
 /**
@@ -165,11 +187,18 @@ export class SessionRepository {
     if (!Number.isSafeInteger(file.session.nextEventCounter) || file.session.nextEventCounter < 0) {
       throw new Error('session nextEventCounter must be a non-negative safe integer')
     }
+    // Registration is the boundary that makes later appends O(1): calibrate
+    // the persisted event counter and blob watermark past every id visible in
+    // the file, so the append path can trust the high-water marks without
+    // scanning entries, summaries, bindings, or the blob map per call.
+    const { nextEventCounter, blobIdWatermark } = calibrateHighWatermarks(file)
     return this.engine.saveSession({
       ...file,
       session: {
         ...file.session,
         revision,
+        nextEventCounter,
+        ...(blobIdWatermark === undefined ? {} : { blobIdWatermark }),
         // Backups are always empty on registration: a snapshot-carried backup
         // holds page pointers whose bytes are not present in this page store,
         // so retaining them would make GC traverse missing pages.
@@ -220,7 +249,10 @@ export class SessionRepository {
       entries: tree.entries(),
       blobs,
     }
-    return this.engine.commitSession(nextFile, file.session.revision)
+    // The loaded file is passed as the previous generation so the commit
+    // skips its own second full load and checks blob immutability against the
+    // in-memory map instead of re-reading every rolling backup's blob page.
+    return this.engine.commitSession(nextFile, file.session.revision, file)
   }
 
   /**

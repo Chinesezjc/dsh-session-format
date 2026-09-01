@@ -366,6 +366,23 @@ describe('SessionRepository', () => {
     expect(loaded.entries.map(entry => entry.blobId)).toEqual([blobId(0), blobId(0), blobId(1)])
   })
 
+  it('calibrates the blob watermark past numeric ids in the map at registration', () => {
+    const { repository } = harness()
+    const tree = SessionTree.fromEntries([{ order: 0, eventId: eventId(0), blobId: blobId(0) }])
+    const blobs = new Map<BlobId, Uint8Array>([
+      [blobId(0), eventEnvelope(0)],
+      [blobId(7), encode('unreferenced-7')],
+      [blobId(3), encode('unreferenced-3')],
+    ])
+    repository.createSession(newFile(tree.entries(), blobs))
+    // Registration calibrates the persisted watermark past the highest
+    // numeric id (7) even though only blob_0 is referenced, so the first
+    // append mints blob_8 instead of colliding with the map.
+    repository.append(sessionId(), surfaceAppend('next'))
+    const loaded = repository.loadSession(sessionId())
+    expect(loaded.entries[1]?.blobId).toBe(blobId(8))
+  })
+
   it('never shadows an existing blob payload when appending', () => {
     const { repository } = harness()
     const tree = SessionTree.fromEntries([
@@ -519,11 +536,14 @@ describe('SessionRepository', () => {
     for (let i = 0; i < 2; i++) tree = tree.append(eventId(i), blobId(i))
     repository.createSession(newFile(tree.entries(), blobs))
     // A direct engine caller can still supply a stalled token; the engine
-    // fails loud instead of committing an unchanged revision.
+    // fails loud instead of committing an unchanged revision. The caller
+    // advances the watermark explicitly (the commit point now enforces it),
+    // so the stalled revision is the only violation left.
     expect(() => engine.compact(
       sessionId(),
       { ...compactionInput(), nextRevision: 'rev-0' as SessionRevision, nextEventCounter: 200 },
       replacementBlobs(),
+      103,
     )).toThrow(/must advance past/)
   })
 

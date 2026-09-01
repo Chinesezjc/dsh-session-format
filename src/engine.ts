@@ -74,6 +74,24 @@ function validateSessionFile(file: SessionFile): void {
     throw new Error('session file nextEventCounter must exceed the highest used EventId number')
   }
   const blobIds = new Set(file.blobs.keys())
+  // The blob watermark is the allocation high-water: a record whose
+  // watermark sits below a numeric blob id in its own map would let the next
+  // allocation mint a colliding id. Registration calibrates it past the map,
+  // so a lower value marks a corrupted or hand-built record (mirroring the
+  // nextEventCounter check above).
+  if (file.session.blobIdWatermark !== undefined) {
+    let highestBlobId = -1
+    for (const id of blobIds) {
+      const match = /^blob_(\d+)$/.exec(id)
+      if (match === null) continue
+      const value = Number(match[1])
+      if (!Number.isSafeInteger(value)) continue
+      if (value > highestBlobId) highestBlobId = value
+    }
+    if (file.session.blobIdWatermark < highestBlobId) {
+      throw new Error(`session blob watermark ${file.session.blobIdWatermark} must not sit below a numeric blob id ${highestBlobId}`)
+    }
+  }
   const eventIds = new Set<EventId>()
   let previousOrder: number | undefined
   for (const entry of file.entries) {
@@ -365,10 +383,19 @@ export class SessionFormatEngine {
    * always carries the advanced revision and the folded binding baseline.
    * @param file - the next file snapshot, carrying the advanced revision.
    * @param expectedRevision - the revision the snapshot was derived from.
+   * @param previousFile - the caller's already-loaded current generation;
+   * used to skip the commit's own second load and to check blob immutability
+   * against the in-memory map. Ignored when its revision does not match the
+   * stored revision, so a mismatched snapshot never validates against the
+   * wrong generation.
    * @returns the stored record after the commit, or undefined when the
    * revision moved.
    */
-  commitSession(file: SessionFile, expectedRevision: SessionRevision): StoredSessionRecord | undefined {
+  commitSession(
+    file: SessionFile,
+    expectedRevision: SessionRevision,
+    previousFile?: SessionFile,
+  ): StoredSessionRecord | undefined {
     validateSessionFile(file)
     const stored = this.store.getSession(file.session.sessionId)
     // An unknown session is a CAS miss, not an invariant violation: no
@@ -377,6 +404,7 @@ export class SessionFormatEngine {
     if (stored === undefined) return undefined
     const next = parseRevision(file.session.revision)
     const current = parseRevision(expectedRevision)
+    const previousIsCurrent = previousFile !== undefined && previousFile.session.revision === stored.revision
     // Only a snapshot derived from the stored generation can rewrite an
     // existing blob payload or regress the counter; a stale expected
     // revision is a CAS miss that must return undefined so callers can
@@ -385,21 +413,46 @@ export class SessionFormatEngine {
     if (stored.revision === expectedRevision) {
       // Blob payloads are immutable: the blob map and every rolling backup
       // must resolve the same bytes for the same id, so a CAS update cannot
-      // rewrite a payload a consumer may still hold.
+      // rewrite a payload a consumer may still hold. With the caller's
+      // previous generation the current map is checked in memory and backup
+      // pages are read lazily only for ids the next file carries that the
+      // previous map does not, so a normal append that mints fresh ids
+      // performs no backup reads; without it every current and backup blob
+      // map page is re-read, as before.
       const priorBytes = new Map<BlobId, Uint8Array>()
-      if (stored.blobMapPage !== undefined) {
-        for (const [blobId, bytes] of loadBlobMap(this.pages, stored.blobMapPage)) priorBytes.set(blobId, bytes)
-      }
-      for (const backup of stored.backups) {
-        if (backup.blobMapPage === undefined) continue
-        for (const [blobId, bytes] of loadBlobMap(this.pages, backup.blobMapPage)) {
-          if (!priorBytes.has(blobId)) priorBytes.set(blobId, bytes)
+      if (previousIsCurrent && previousFile !== undefined) {
+        for (const [blobId, bytes] of previousFile.blobs) priorBytes.set(blobId, bytes)
+        for (const [blobId, bytes] of file.blobs) {
+          const prior = priorBytes.get(blobId)
+          if (prior !== undefined) {
+            if (bytes.length !== prior.length || bytes.some((byte, index) => byte !== prior[index])) {
+              throw new Error(`blob ${blobId} is immutable; a CAS update must not rewrite its content`)
+            }
+            continue
+          }
+          // The id is not in the current generation; it may still exist in a
+          // rolling backup (a compaction dropped it from the current map).
+          const historical = this.findBlobInBackups(stored, blobId)
+          if (historical !== undefined
+            && (bytes.length !== historical.length || bytes.some((byte, index) => byte !== historical[index]))) {
+            throw new Error(`blob ${blobId} is immutable; a CAS update must not rewrite its content`)
+          }
         }
-      }
-      for (const [blobId, bytes] of file.blobs) {
-        const prior = priorBytes.get(blobId)
-        if (prior !== undefined && (bytes.length !== prior.length || bytes.some((byte, index) => byte !== prior[index]))) {
-          throw new Error(`blob ${blobId} is immutable; a CAS update must not rewrite its content`)
+      } else {
+        if (stored.blobMapPage !== undefined) {
+          for (const [blobId, bytes] of loadBlobMap(this.pages, stored.blobMapPage)) priorBytes.set(blobId, bytes)
+        }
+        for (const backup of stored.backups) {
+          if (backup.blobMapPage === undefined) continue
+          for (const [blobId, bytes] of loadBlobMap(this.pages, backup.blobMapPage)) {
+            if (!priorBytes.has(blobId)) priorBytes.set(blobId, bytes)
+          }
+        }
+        for (const [blobId, bytes] of file.blobs) {
+          const prior = priorBytes.get(blobId)
+          if (prior !== undefined && (bytes.length !== prior.length || bytes.some((byte, index) => byte !== prior[index]))) {
+            throw new Error(`blob ${blobId} is immutable; a CAS update must not rewrite its content`)
+          }
         }
       }
       if (file.session.nextEventCounter < stored.nextEventCounter) {
@@ -419,7 +472,7 @@ export class SessionFormatEngine {
     // the table still pins every live entry), and only grows (an EventId is
     // never unbound once minted). A surviving entry must keep its binding,
     // and a newly minted id must live in this session's own namespace.
-    const previous = this.loadSession(file.session.sessionId)
+    const previous = previousIsCurrent && previousFile !== undefined ? previousFile : this.loadSession(file.session.sessionId)
     const usedEventBindings = new Map<EventId, BlobId>()
     for (const [eventId, blobId] of stored.usedEventBindings ?? []) usedEventBindings.set(eventId, blobId)
     for (const entry of previous.entries) {
@@ -522,17 +575,21 @@ export class SessionFormatEngine {
       }
     }
     const nextFile = performCompaction({ ...file, blobs }, input)
-    validateSessionFile(nextFile)
+    // The watermark is advanced before validation: the compaction
+    // intermediate carries the old watermark while its blob map already
+    // contains the replacement blobs, which the record-level watermark check
+    // would reject. An omitted nextWatermark keeps the loaded file's
+    // watermark: a direct engine.compact call must not wipe the persisted
+    // high-water.
+    const watermark = nextWatermark ?? file.session.blobIdWatermark
+    const committedFile = watermark === undefined
+      ? nextFile
+      : { ...nextFile, session: { ...nextFile.session, blobIdWatermark: watermark } }
+    validateSessionFile(committedFile)
     // A committed root must round-trip through the durable container so a
     // serialization defect never lands in the store.
-    deserializeSessionFile(serializeSessionFile(nextFile))
-    // Omitted nextWatermark keeps the loaded file's watermark: a direct
-    // engine.compact call must not wipe the persisted high-water.
-    const watermark = nextWatermark ?? file.session.blobIdWatermark
-    const record = this.commitSession(
-      watermark === undefined ? nextFile : { ...nextFile, session: { ...nextFile.session, blobIdWatermark: watermark } },
-      file.session.revision,
-    )
+    deserializeSessionFile(serializeSessionFile(committedFile))
+    const record = this.commitSession(committedFile, file.session.revision)
     /* v8 ignore next 2 -- defensive: commitSession rejects a stale expected revision */
     if (record === undefined) return undefined
     const summaries = nextFile.compacted
@@ -567,6 +624,27 @@ export class SessionFormatEngine {
    */
   gc(): number {
     return collectGarbage(this.pages, this.store.sessions())
+  }
+
+  /** Find one blob payload in the rolling backup generations.
+   * Used by the previous-file commit path when the next file carries a blob
+   * id the current generation no longer holds (a compaction dropped it from
+   * the current map but a retained backup still pins its bytes), so the
+   * immutability check stays complete without reading every backup page on
+   * every commit.
+   * @param stored - the stored session record whose backups are searched.
+   * @param blobId - blob id to look up.
+   * @returns the payload bytes from the first backup carrying the id, or
+   * undefined when no retained backup holds it.
+   */
+  private findBlobInBackups(stored: StoredSessionRecord, blobId: BlobId): Uint8Array | undefined {
+    for (const backup of stored.backups) {
+      if (backup.blobMapPage === undefined) continue
+      for (const [id, bytes] of loadBlobMap(this.pages, backup.blobMapPage)) {
+        if (id === blobId) return bytes
+      }
+    }
+    return undefined
   }
 
   private buildRecord(file: SessionFile, usedEventBindings: Map<EventId, BlobId>): StoredSessionRecord {

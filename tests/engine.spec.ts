@@ -1805,6 +1805,77 @@ describe('SessionFormatEngine', () => {
       .toThrow(/immutable/)
   })
 
+  it('rejects a previous-file commit that rewrites an existing blob', () => {
+    const engine = new SessionFormatEngine(new PageStore(), new SessionStore())
+    engine.saveSession(makeFile(3))
+    const current = engine.loadSession(sessionId())
+    const tampered = {
+      ...current,
+      session: { ...current.session, revision: 'rev-1' as SessionRevision },
+      blobs: new Map(current.blobs).set(blobId(1), new TextEncoder().encode('tampered')),
+    }
+    // The repository append path passes the loaded previous generation; the
+    // in-memory immutability check must still reject a rewritten payload.
+    expect(() => engine.commitSession(tampered, current.session.revision, current))
+      .toThrow(/immutable/)
+  })
+
+  it('rejects a previous-file commit that reintroduces a backup-retained blob', () => {
+    const engine = new SessionFormatEngine(new PageStore(), new SessionStore())
+    engine.saveSession(makeFile(3))
+    // Drop blob 1 from the current generation so the backup retains it.
+    const dropped = engine.loadSession(sessionId())
+    const withoutBlob = {
+      ...dropped,
+      session: { ...dropped.session, revision: 'rev-1' as SessionRevision },
+      entries: dropped.entries.filter(entry => entry.blobId !== blobId(1)),
+      blobs: new Map([...dropped.blobs].filter(([id]) => id !== blobId(1))),
+    }
+    engine.saveSession(withoutBlob, dropped.session.revision)
+    // Reintroduce blob 1 with different bytes through the previous-file
+    // commit: the id is absent from the in-memory previous map, so the
+    // check reads the retained backup page lazily and must still reject.
+    const current = engine.loadSession(sessionId())
+    const reintroduced = {
+      ...current,
+      session: { ...current.session, revision: 'rev-2' as SessionRevision },
+      blobs: new Map(current.blobs).set(blobId(1), new TextEncoder().encode('tampered')),
+    }
+    expect(() => engine.commitSession(reintroduced, current.session.revision, current))
+      .toThrow(/immutable/)
+  })
+
+  it('ignores a previous-file snapshot whose revision does not match the stored record', () => {
+    const engine = new SessionFormatEngine(new PageStore(), new SessionStore())
+    engine.saveSession(makeFile(3))
+    const current = engine.loadSession(sessionId())
+    // A caller-passed previous generation from a different generation is
+    // ignored: the commit loads the real current generation instead, and the
+    // rewritten blob is still rejected.
+    const stalePrevious = { ...current, session: { ...current.session, revision: 'rev-999' as SessionRevision } }
+    const tampered = {
+      ...current,
+      session: { ...current.session, revision: 'rev-1' as SessionRevision },
+      blobs: new Map(current.blobs).set(blobId(1), new TextEncoder().encode('tampered')),
+    }
+    expect(() => engine.commitSession(tampered, current.session.revision, stalePrevious))
+      .toThrow(/immutable/)
+  })
+
+  it('rejects a record whose blob watermark sits below a numeric blob id', () => {
+    const engine = new SessionFormatEngine(new PageStore(), new SessionStore())
+    const file = makeFile(1)
+    const lowWatermark = {
+      ...file,
+      session: { ...file.session, blobIdWatermark: 2 },
+      blobs: new Map(file.blobs).set(blobId(5), new TextEncoder().encode('unreferenced')),
+    }
+    // The record-level watermark check refuses a watermark below a numeric
+    // id in the file's own map, so a hand-built or imported record can never
+    // mint a colliding blob id.
+    expect(() => engine.saveSession(lowWatermark)).toThrow(/blob watermark/)
+  })
+
   it('rejects a CAS update that rebinds a surviving EventId to a new blob', () => {
     // EventIds are stable identity: keeping the event but pointing it at a
     // different blob would make the current root and a rolling backup resolve
