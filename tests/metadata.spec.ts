@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
+  loadBlobChain,
   loadBlobMap,
   loadCompactionSummaries,
   loadReferences,
+  saveBlobAppends,
   saveBlobMap,
   saveCompactionSummaries,
   saveReferences,
@@ -11,7 +13,7 @@ import { encodePage } from '../src/pages.ts'
 import { PageStore } from '../src/page-store.ts'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { BlobId, CompactionId, CompactionSummary, EventId, ReferenceRecord } from '../src/index.ts'
+import type { BlobId, CompactionId, CompactionSummary, EventId, PageId, ReferenceRecord } from '../src/index.ts'
 
 describe('metadata pages', () => {
   it('persists and loads blob maps', () => {
@@ -590,5 +592,54 @@ describe('metadata pages', () => {
     const store = new PageStore()
     const page = saveCompactionSummaries(store, [])
     expect(loadCompactionSummaries(store, page)).toEqual([])
+  })
+})
+
+function chainEncode(text: string): Uint8Array {
+  return new TextEncoder().encode(text)
+}
+
+describe('blob map chain', () => {
+  it('appends blobs incrementally and loads the merged map', () => {
+    const store = new PageStore()
+    let head: PageId | undefined
+    head = saveBlobAppends(store, head, new Map([['blob_1' as BlobId, chainEncode('one')]]))
+    head = saveBlobAppends(store, head, new Map([['blob_2' as BlobId, chainEncode('two')]]))
+    const loaded = loadBlobChain(store, head)
+    expect(loaded.size).toBe(2)
+    expect(new TextDecoder().decode(loaded.get('blob_1' as BlobId))).toBe('one')
+    expect(new TextDecoder().decode(loaded.get('blob_2' as BlobId))).toBe('two')
+  })
+
+  it('loads a standalone pre-chain map page', () => {
+    const store = new PageStore()
+    const page = saveBlobMap(store, new Map([['blob_1' as BlobId, chainEncode('one')]]))
+    const loaded = loadBlobChain(store, page)
+    expect(loaded.size).toBe(1)
+  })
+
+  it('rejects the same blob id with different bytes across chain pages', () => {
+    const store = new PageStore()
+    let head: PageId | undefined
+    head = saveBlobAppends(store, head, new Map([['blob_1' as BlobId, chainEncode('one')]]))
+    head = saveBlobAppends(store, head, new Map([['blob_1' as BlobId, chainEncode('two')]]))
+    expect(() => loadBlobChain(store, head)).toThrow(/different bytes/)
+  })
+
+  it('rejects a chain page cycle', () => {
+    // Two pages pointing at each other, hand-built in an injectable backing
+    // map (the immutable store cannot produce a cycle itself).
+    const backing = new Map<PageId, Uint8Array>()
+    const store = new PageStore(backing)
+    const chainPage = (pageId: PageId, prev: PageId | undefined): void => {
+      backing.set(pageId, encodePage(pageId, new TextEncoder().encode(JSON.stringify({
+        kind: 'blob-appends',
+        ...(prev === undefined ? {} : { prev }),
+        blobs: {},
+      }))))
+    }
+    chainPage('page_0' as PageId, 'page_1' as PageId)
+    chainPage('page_1' as PageId, 'page_0' as PageId)
+    expect(() => loadBlobChain(store, 'page_0' as PageId)).toThrow(/cycle/)
   })
 })

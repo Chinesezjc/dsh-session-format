@@ -12,14 +12,15 @@ import { forkSessionFile } from './fork.ts'
 import { collectGarbage } from './gc.ts'
 import type { BlobId, CompactionSummary, EventId, PageId, SessionId, SessionRevision, StoredSessionRecord } from './index.ts'
 import {
-  loadBlobMap,
+  loadBlobChain,
   loadCompactionSummaries,
   loadReferences,
+  saveBlobAppends,
   saveBlobMap,
   saveCompactionSummaries,
   saveReferences,
 } from './metadata.ts'
-import { loadMultiPageTree, saveMultiPageTree } from './multi-page.ts'
+import { appendEntryToTree, loadMultiPageTree, saveMultiPageTree } from './multi-page.ts'
 import type { PageStore } from './page-store.ts'
 import { SessionStore } from './store.ts'
 
@@ -32,6 +33,25 @@ export function parseRevision(revision: SessionRevision): number | undefined {
   if (match === null) return undefined
   const value = Number(match[1])
   return Number.isSafeInteger(value) ? value : undefined
+}
+
+/** The revision following a given one.
+ * @param revision - the current revision, in the `rev-<n>` form.
+ * @returns the next revision.
+ */
+export function nextRevision(revision: SessionRevision): SessionRevision {
+  const current = parseRevision(revision)
+  // Stored revisions are always advanceable safe-integer tokens (createSession
+  // and the engine validate them), so only the ceiling advance is reachable.
+  /* v8 ignore next 1 -- defensive: stored revisions always parse as safe tokens */
+  if (current === undefined) throw new Error(`revision ${revision} is not a rev-<n> token`)
+  // A registered session always advances at least once (createSession rejects
+  // ceiling revisions); this guard stops a session that has reached the
+  // ceiling revision from minting a token no later commit can advance.
+  if (current >= Number.MAX_SAFE_INTEGER - 1) {
+    throw new Error(`revision ${revision} cannot advance within the safe integer range`)
+  }
+  return `rev-${current + 1}` as SessionRevision
 }
 
 /** Reject a session file whose relationships do not hold before publishing.
@@ -440,11 +460,11 @@ export class SessionFormatEngine {
         }
       } else {
         if (stored.blobMapPage !== undefined) {
-          for (const [blobId, bytes] of loadBlobMap(this.pages, stored.blobMapPage)) priorBytes.set(blobId, bytes)
+          for (const [blobId, bytes] of loadBlobChain(this.pages, stored.blobMapPage)) priorBytes.set(blobId, bytes)
         }
         for (const backup of stored.backups) {
           if (backup.blobMapPage === undefined) continue
-          for (const [blobId, bytes] of loadBlobMap(this.pages, backup.blobMapPage)) {
+          for (const [blobId, bytes] of loadBlobChain(this.pages, backup.blobMapPage)) {
             if (!priorBytes.has(blobId)) priorBytes.set(blobId, bytes)
           }
         }
@@ -512,6 +532,16 @@ export class SessionFormatEngine {
     return published
   }
 
+  /** Read the current stored record without loading the session file.
+   * @param sessionId - session to read.
+   * @returns the stored record, or undefined when absent.
+   */
+  record(sessionId: SessionId): StoredSessionRecord | undefined {
+    // The append fast path reads control fields only; callers that need the
+    // binding table use loadSession or getSession.
+    return this.store.getRecord(sessionId)
+  }
+
   /** Load a session file from the page store.
    * @param sessionId - session to load.
    * @returns the reconstructed session file.
@@ -522,7 +552,7 @@ export class SessionFormatEngine {
     const tree = SessionTree.fromEntries(toArray(loadMultiPageTree(this.pages, record.rootPage)))
     const blobs = record.blobMapPage === undefined
       ? new Map()
-      : loadBlobMap(this.pages, record.blobMapPage)
+      : loadBlobChain(this.pages, record.blobMapPage)
     const references = record.referencesPage === undefined
       ? []
       : loadReferences(this.pages, record.referencesPage)
@@ -546,6 +576,93 @@ export class SessionFormatEngine {
     validateSessionFile(file)
     deserializeSessionFile(serializeSessionFile(file))
     return file
+  }
+
+  /** Persist one append without reconstructing the whole session file.
+   * The append writes one new leaf entry along the rightmost tree path
+   * (O(depth) pages), appends the new blob to the blob-map chain (one page),
+   * and updates the record's root, counter, watermark, revision, and rolling
+   * backups in one compare-and-swap commit, so the operation costs O(log n)
+   * in the session size instead of rewriting the whole snapshot. The caller
+   * must follow the repository allocation contract (the EventId counter and
+   * the blob watermark advance past the stored values); the commit validates
+   * those monotonicities, the revision advance, and the stored generation
+   * match, and falls back to the whole-snapshot commit when the tree order
+   * cannot advance (the number ceiling) or the session is unknown.
+   * @param sessionId - session to append to.
+   * @param eventId - the minted EventId for the appended event.
+   * @param blobId - the minted BlobId for the appended payload.
+   * @param nextEventCounter - the advanced event counter.
+   * @param blobIdWatermark - the advanced blob watermark.
+   * @param payload - the event payload bytes.
+   * @param expectedRevision - the revision the append was derived from.
+   * @returns the stored record (without its binding table) after the commit,
+   * or undefined when a concurrent writer advanced the session first.
+   */
+  commitAppend(
+    sessionId: SessionId,
+    eventId: EventId,
+    blobId: BlobId,
+    nextEventCounter: number,
+    blobIdWatermark: number,
+    payload: Uint8Array,
+    expectedRevision: SessionRevision,
+  ): StoredSessionRecord | undefined {
+    // The control-fields read avoids assembling the binding table, so the
+    // whole append stays O(log n) in the session size.
+    const stored = this.store.getRecord(sessionId)
+    // An unknown session or a stale expected revision is a CAS miss, not an
+    // invariant violation: the caller reloads the record and retries.
+    if (stored === undefined || stored.revision !== expectedRevision) return undefined
+    if (!Number.isSafeInteger(nextEventCounter) || nextEventCounter <= stored.nextEventCounter) {
+      throw new Error(`committed nextEventCounter ${nextEventCounter} must advance the stored counter ${stored.nextEventCounter}`)
+    }
+    if (!Number.isSafeInteger(blobIdWatermark) || blobIdWatermark <= (stored.blobIdWatermark ?? -1)) {
+      throw new Error(`committed blob watermark ${blobIdWatermark} must advance the stored watermark ${stored.blobIdWatermark}`)
+    }
+    let rootPage: PageId
+    try {
+      rootPage = appendEntryToTree(this.pages, stored.rootPage, eventId, blobId)
+    } catch (error) {
+      // The rightmost order hit the number ceiling; fall back to the
+      // whole-snapshot path, which renumbers the tree densely.
+      if (!(error instanceof Error) || !error.message.includes('full renumber')) throw error
+      const file = this.loadSession(sessionId)
+      const tree = SessionTree.fromEntries(file.entries).append(eventId, blobId)
+      const nextFile: SessionFile = {
+        ...file,
+        session: {
+          ...file.session,
+          revision: nextRevision(file.session.revision),
+          nextEventCounter,
+          blobIdWatermark,
+        },
+        entries: tree.entries(),
+        blobs: new Map(file.blobs).set(blobId, payload),
+      }
+      return this.commitSession(nextFile, expectedRevision, file)
+    }
+    const blobMapPage = saveBlobAppends(this.pages, stored.blobMapPage, new Map([[blobId, payload]]))
+    // The record update carries no binding table: the store appends the new
+    // binding to its internal table (and the durable binding log) in O(1),
+    // and its appendability check rejects a conflicting rebind.
+    const { usedEventBindings: _priorTable, ...storedBase } = stored
+    const nextRecord: StoredSessionRecord = {
+      ...storedBase,
+      rootPage,
+      blobMapPage,
+      revision: nextRevision(stored.revision),
+      nextEventCounter,
+      blobIdWatermark,
+    }
+    if (!this.store.commit(sessionId, nextRecord, expectedRevision, new Map([[eventId, blobId]]))) {
+      return undefined
+    }
+    // Return the control-fields record: assembling the binding table here
+    // would cost O(n) per append. Callers that need the table use loadSession.
+    const published = this.store.getRecord(sessionId)
+    if (published === undefined) throw new Error(`session ${sessionId} not found after commit`)
+    return published
   }
 
   /** Run one physical compaction with a CAS commit.
@@ -640,7 +757,7 @@ export class SessionFormatEngine {
   private findBlobInBackups(stored: StoredSessionRecord, blobId: BlobId): Uint8Array | undefined {
     for (const backup of stored.backups) {
       if (backup.blobMapPage === undefined) continue
-      for (const [id, bytes] of loadBlobMap(this.pages, backup.blobMapPage)) {
+      for (const [id, bytes] of loadBlobChain(this.pages, backup.blobMapPage)) {
         if (id === blobId) return bytes
       }
     }

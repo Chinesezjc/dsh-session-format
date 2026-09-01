@@ -822,3 +822,86 @@ describe('SessionRepository', () => {
     expect(repository.projectionNeedsRebuild(sessionId(), folded, summary!)).toBe(true)
   })
 })
+
+  it('splits the persisted tree across many incremental appends and loads back', () => {
+    const { repository, engine } = harness()
+    repository.createSession(newFile())
+    for (let i = 0; i < 30; i++) repository.append(sessionId(), surfaceAppend(`e${i}`))
+    const loaded = repository.loadSession(sessionId())
+    expect(loaded.entries).toHaveLength(30)
+    expect(loaded.entries.every((entry, index) => index === 0 || entry.order > loaded.entries[index - 1]!.order)).toBe(true)
+    expect(loaded.blobs.size).toBe(30)
+    expect(loaded.session.nextEventCounter).toBe(30)
+    expect(loaded.session.revision).toBe('rev-30')
+    expect(loaded.session.usedEventBindings?.size).toBe(30)
+    // The record carries a chained blob-map head whose chain is fully readable.
+    expect(engine.record(sessionId())?.blobMapPage).toBeDefined()
+  })
+
+  it('rejects an incremental append whose counter does not advance', () => {
+    const { repository, engine } = harness()
+    repository.createSession(newFile())
+    const record = engine.record(sessionId())!
+    expect(() => engine.commitAppend(
+      sessionId(),
+      'evt_sess_repo_0' as EventId,
+      'blob_0' as BlobId,
+      record.nextEventCounter, // not advanced
+      0,
+      surfaceAppend('x'),
+      record.revision,
+    )).toThrow(/must advance the stored counter/)
+  })
+
+  it('rejects an incremental append whose blob watermark does not advance', () => {
+    const { repository, engine } = harness()
+    repository.createSession(newFile())
+    const record = engine.record(sessionId())!
+    expect(() => engine.commitAppend(
+      sessionId(),
+      'evt_sess_repo_0' as EventId,
+      'blob_0' as BlobId,
+      record.nextEventCounter + 1,
+      -1, // not advanced
+      surfaceAppend('x'),
+      record.revision,
+    )).toThrow(/must advance the stored watermark/)
+  })
+
+  it('treats a stale incremental append as a CAS miss', () => {
+    const { repository, engine } = harness()
+    repository.createSession(newFile())
+    const record = engine.record(sessionId())!
+    const result = engine.commitAppend(
+      sessionId(),
+      'evt_sess_repo_0' as EventId,
+      'blob_0' as BlobId,
+      record.nextEventCounter + 1,
+      0,
+      surfaceAppend('x'),
+      'rev-99' as SessionRevision, // stale
+    )
+    expect(result).toBeUndefined()
+    expect(repository.loadSession(sessionId()).entries).toHaveLength(0)
+  })
+
+  it('treats an incremental append that rebinds a used EventId as a CAS miss', () => {
+    const { repository, engine } = harness()
+    repository.createSession(newFile())
+    repository.append(sessionId(), surfaceAppend('first'))
+    const record = engine.record(sessionId())!
+    // evt_sess_repo_0 is already bound to blob_0; committing the same id
+    // under a different blob fails the binding-append check and returns a
+    // CAS miss instead of rebinding history.
+    const result = engine.commitAppend(
+      sessionId(),
+      'evt_sess_repo_0' as EventId,
+      'blob_9' as BlobId,
+      record.nextEventCounter + 1,
+      9,
+      surfaceAppend('x'),
+      record.revision,
+    )
+    expect(result).toBeUndefined()
+    expect(repository.loadSession(sessionId()).session.usedEventBindings?.get('evt_sess_repo_0' as EventId)).toBe('blob_0' as BlobId)
+  })

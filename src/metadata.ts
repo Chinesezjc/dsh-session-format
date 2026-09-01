@@ -57,6 +57,78 @@ export function loadBlobMap(store: PageStore, pageId: PageId): Map<BlobId, Uint8
   return blobs
 }
 
+/** Append new blobs as one checksummed page chained to the current blob-map
+ * head. The chain keeps append O(1): each append writes exactly one new page
+ * holding only the new payloads instead of rewriting the whole map. A full
+ * path (registration, compaction, import) rewrites the map as one standalone
+ * page via {@link saveBlobMap}, collapsing the chain.
+ * @param store - page store to write into.
+ * @param head - current blob-map chain head page, or undefined when the
+ * session has no blob map yet.
+ * @param blobs - new blob payloads to append to the map.
+ * @returns the page id of the new chain head.
+ */
+export function saveBlobAppends(store: PageStore, head: PageId | undefined, blobs: ReadonlyMap<BlobId, Uint8Array>): PageId {
+  const record = Object.fromEntries(
+    [...blobs].map(([blobId, bytes]) => [blobId, { base64: Buffer.from(bytes).toString('base64') }]),
+  ) as SerializedBlobMap['blobs']
+  const serialized: Record<string, unknown> = {
+    kind: 'blob-appends',
+    blobs: record,
+  }
+  if (head !== undefined) serialized.prev = head
+  return store.writePage(new TextEncoder().encode(JSON.stringify(serialized)))
+}
+
+/** Load every blob payload reachable from a blob-map chain head.
+ * Accepts both the chained `blob-appends` pages and a standalone map page
+ * (the pre-chain full-map format), so a store written before the chain change
+ * still loads; a page carrying neither shape is rejected. The same blob id
+ * appearing in two chain pages with different bytes is rejected, so a
+ * corrupted chain cannot silently resolve one id to two payloads.
+ * @param store - page store holding the chain.
+ * @param head - chain head page id, or undefined for an empty map.
+ * @returns the merged blob map.
+ */
+export function loadBlobChain(store: PageStore, head: PageId | undefined): Map<BlobId, Uint8Array> {
+  const blobs = new Map<BlobId, Uint8Array>()
+  let current = head
+  const visited = new Set<PageId>()
+  while (current !== undefined) {
+    if (visited.has(current)) {
+      throw new Error(`blob map chain page ${current} referenced more than once or in a cycle`)
+    }
+    visited.add(current)
+    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(store.readPage(current)))
+    if (!isRecord(parsed) || !isRecord(parsed.blobs)) {
+      throw new Error(`blob map page ${current} must contain a blobs object`)
+    }
+    for (const [blobId, encoded] of Object.entries(parsed.blobs)) {
+      if (!isRecord(encoded) || typeof encoded.base64 !== 'string' || !isValidBase64(encoded.base64)) {
+        throw new Error(`blob map page ${current} entry ${blobId} must carry a valid base64 string`)
+      }
+      const bytes = Buffer.from(encoded.base64, 'base64')
+      const prior = blobs.get(blobId as BlobId)
+      if (prior !== undefined && (prior.length !== bytes.length || prior.some((byte, index) => byte !== bytes[index]))) {
+        throw new Error(`blob ${blobId} appears with different bytes in the blob map chain`)
+      }
+      if (prior === undefined) blobs.set(blobId as BlobId, bytes)
+    }
+    if (parsed.kind === 'blob-appends') {
+      if (parsed.prev !== undefined && typeof parsed.prev !== 'string') {
+        throw new Error(`blob map page ${current} prev must be a page id or absent`)
+      }
+      current = parsed.prev as PageId | undefined
+    } else if (parsed.kind === undefined) {
+      // The pre-chain standalone map page carries no kind and no prev.
+      current = undefined
+    } else {
+      throw new Error(`blob map page ${current} carries unknown kind ${String(parsed.kind)}`)
+    }
+  }
+  return blobs
+}
+
 function isValidBase64(value: string): boolean {
   if (value.length === 0) return true
   // Padding may only appear at the end with at most two characters, so

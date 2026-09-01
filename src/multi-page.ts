@@ -192,3 +192,145 @@ function fromInternal(store: PageStore, node: Record<string, unknown>, pageId: P
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
+
+/** One page-level tree node: a leaf or internal node parsed from one page
+ * without loading its subtree.
+ */
+type TreeNodePage =
+  | { readonly kind: 'leaf'; readonly entries: readonly LeafEntry[] }
+  | { readonly kind: 'internal'; readonly keys: readonly number[]; readonly children: readonly PageId[] }
+
+/** Parse one tree-node page at page level, validating its structure without
+ * loading the subtree. Mirrors {@link loadNode}'s per-page checks.
+ * @param store - page store holding the tree.
+ * @param pageId - node page to parse.
+ * @returns the parsed node page.
+ */
+function readTreeNode(store: PageStore, pageId: PageId): TreeNodePage {
+  const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(store.readPage(pageId)))
+  if (!isRecord(parsed) || parsed.kind !== 'leaf' && parsed.kind !== 'internal') {
+    throw new Error(`page ${pageId} must be a leaf or internal tree node`)
+  }
+  if (parsed.kind === 'leaf') {
+    return { kind: 'leaf', entries: parseLeafEntries(parsed, pageId) }
+  }
+  if (!Array.isArray(parsed.children)
+    || !parsed.children.every((child): child is PageId => typeof child === 'string')
+    || !Array.isArray(parsed.keys)
+    || !parsed.keys.every((key): key is number => typeof key === 'number' && Number.isFinite(key))) {
+    throw new Error(`internal page ${pageId} must carry a keys number array and a children page-id array`)
+  }
+  if (parsed.children.length < 2
+    || parsed.children.length > MAX_KEYS + 1
+    || parsed.keys.length > MAX_KEYS
+    || parsed.keys.length !== parsed.children.length - 1) {
+    throw new Error(`invalid internal page ${pageId}: ${parsed.keys.length} keys for ${parsed.children.length} children`)
+  }
+  for (let index = 1; index < parsed.keys.length; index += 1) {
+    if (parsed.keys[index]! <= parsed.keys[index - 1]!) {
+      throw new Error(`internal page ${pageId} keys must be strictly increasing`)
+    }
+  }
+  return { kind: 'internal', keys: [...parsed.keys], children: [...parsed.children] }
+}
+
+/** The smallest order present in a subtree root page.
+ * @param store - page store holding the tree.
+ * @param pageId - subtree root page.
+ * @returns the first entry's order.
+ */
+function firstOrderOf(store: PageStore, pageId: PageId): number {
+  let current = pageId
+  for (;;) {
+    const node = readTreeNode(store, current)
+    if (node.kind === 'leaf') {
+      const first = node.entries[0]
+      if (first === undefined) throw new Error(`leaf page ${current} is empty`)
+      return first.order
+    }
+    const firstChild = node.children[0]
+    if (firstChild === undefined) throw new Error(`internal page ${current} must not be empty`)
+    current = firstChild
+  }
+}
+
+function writeLeafPage(store: PageStore, entries: readonly LeafEntry[]): PageId {
+  return store.writePage(new TextEncoder().encode(JSON.stringify({ kind: 'leaf', entries: [...entries] })))
+}
+
+function writeInternalPage(store: PageStore, keys: readonly number[], children: readonly PageId[]): PageId {
+  return store.writePage(new TextEncoder().encode(JSON.stringify({ kind: 'internal', keys: [...keys], children: [...children] })))
+}
+
+/** Result of appending into one subtree: the subtree's new root page and,
+ * when the root split, the new right sibling page.
+ */
+interface AppendResult {
+  readonly rootPage: PageId
+  readonly split?: PageId
+}
+
+/** Append one entry to the rightmost leaf of a subtree, copying the rightmost
+ * path. Each level writes at most two new pages (the copied node and, on a
+ * split, its right sibling), so the whole append writes O(depth) pages and
+ * reads O(depth) pages. Throws when the entry order cannot advance (the
+ * rightmost order is at the number ceiling); callers fall back to a full
+ * renumber in that case.
+ * @param store - page store holding the tree.
+ * @param pageId - subtree root page.
+ * @param eventId - identity of the appended event.
+ * @param blobId - blob holding the event payload.
+ * @returns the new subtree root page and any split sibling.
+ */
+function appendInto(store: PageStore, pageId: PageId, eventId: EventId, blobId: BlobId): AppendResult {
+  const node = readTreeNode(store, pageId)
+  if (node.kind === 'leaf') {
+    const last = node.entries[node.entries.length - 1]
+    const maxOrder = last === undefined ? -1 : last.order
+    const nextOrder = maxOrder + 1
+    if (nextOrder <= maxOrder) {
+      throw new Error('tree order cannot advance within the safe number range; full renumber required')
+    }
+    const entries = [...node.entries, { order: nextOrder, eventId, blobId }]
+    if (entries.length <= MAX_ENTRIES) return { rootPage: writeLeafPage(store, entries) }
+    const mid = Math.ceil(entries.length / 2)
+    return {
+      rootPage: writeLeafPage(store, entries.slice(0, mid)),
+      split: writeLeafPage(store, entries.slice(mid)),
+    }
+  }
+  const lastChild = node.children[node.children.length - 1]
+  if (lastChild === undefined) throw new Error(`internal page ${pageId} must not be empty`)
+  const result = appendInto(store, lastChild, eventId, blobId)
+  const children = [...node.children]
+  children[children.length - 1] = result.rootPage
+  const keys = [...node.keys]
+  if (result.split !== undefined) {
+    children.push(result.split)
+    keys.push(firstOrderOf(store, result.split))
+  }
+  if (keys.length <= MAX_KEYS) return { rootPage: writeInternalPage(store, keys, children) }
+  const mid = Math.ceil(keys.length / 2)
+  return {
+    rootPage: writeInternalPage(store, keys.slice(0, mid), children.slice(0, mid + 1)),
+    split: writeInternalPage(store, keys.slice(mid + 1), children.slice(mid + 1)),
+  }
+}
+
+/** Append one event to the rightmost leaf of a persisted B+Tree by copying
+ * the rightmost path, and return the new root page. Writes O(depth) pages
+ * instead of rewriting every node, so append stays O(log n) in the tree size;
+ * a root split mints a new internal root. Throws when the entry order cannot
+ * advance (see {@link appendInto}); callers fall back to a full renumber.
+ * @param store - page store holding the tree.
+ * @param rootPage - current root page; may be an empty leaf page.
+ * @param eventId - identity of the appended event.
+ * @param blobId - blob holding the event payload.
+ * @returns the new root page.
+ */
+export function appendEntryToTree(store: PageStore, rootPage: PageId, eventId: EventId, blobId: BlobId): PageId {
+  const result = appendInto(store, rootPage, eventId, blobId)
+  if (result.split === undefined) return result.rootPage
+  const keys = [firstOrderOf(store, result.split)]
+  return writeInternalPage(store, keys, [result.rootPage, result.split])
+}

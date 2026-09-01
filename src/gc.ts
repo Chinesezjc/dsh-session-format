@@ -35,7 +35,17 @@ function referencedPageIds(payload: Uint8Array): PageId[] {
     // deleting pages a structurally damaged reachable page would reference.
     throw new Error('gc cannot traverse a reachable page with a non-JSON payload')
   }
-  const node = parsed as { kind?: unknown; children?: unknown }
+  const node = parsed as { kind?: unknown; children?: unknown; prev?: unknown }
+  if (node.kind === 'blob-appends') {
+    // An incremental blob-map chain page: `prev` points at the previous chain
+    // page, so the whole chain stays reachable from the record's blob-map
+    // head. A malformed prev means a corrupted reachable page, and treating it
+    // as childless would let the sweep delete the chain it references.
+    if (node.prev !== undefined && typeof node.prev !== 'string') {
+      throw new Error('gc cannot traverse a blob-appends page without a string prev')
+    }
+    return node.prev === undefined ? [] : [node.prev as PageId]
+  }
   if (node.kind === 'internal') {
     // An internal node must carry a children array of page ids; a
     // checksum-valid page declaring kind=internal without one is corrupted,

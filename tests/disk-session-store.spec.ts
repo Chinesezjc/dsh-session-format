@@ -314,3 +314,67 @@ describe('DiskSessionStore', () => {
     expect(names.some(name => name.endsWith('.tmp'))).toBe(false)
   })
 })
+
+describe('DiskSessionStore binding log', () => {
+  it('persists the binding table in the log and rebuilds it', () => {
+    const dir = tempDir()
+    const store = new DiskSessionStore(dir)
+    const base = record('rev-1' as SessionRevision, 'sess_bind' as SessionId)
+    store.putSession({
+      ...base,
+      usedEventBindings: new Map([
+        ['evt_sess_bind_0' as EventId, 'blob_0' as BlobId],
+        ['evt_sess_bind_1' as EventId, 'blob_1' as BlobId],
+      ]),
+    })
+    store.commit(
+      'sess_bind' as SessionId,
+      {
+        ...base,
+        revision: 'rev-2' as SessionRevision,
+        usedEventBindings: new Map([
+          ['evt_sess_bind_0' as EventId, 'blob_0' as BlobId],
+          ['evt_sess_bind_1' as EventId, 'blob_1' as BlobId],
+          ['evt_sess_bind_2' as EventId, 'blob_2' as BlobId],
+        ]),
+      },
+      'rev-1' as SessionRevision,
+      new Map([['evt_sess_bind_2' as EventId, 'blob_2' as BlobId]]),
+    )
+    const rebuilt = new DiskSessionStore(dir)
+    const restored = rebuilt.getSession('sess_bind' as SessionId)!
+    expect(restored.usedEventBindings?.size).toBe(3)
+    expect(restored.usedEventBindings?.get('evt_sess_bind_2' as EventId)).toBe('blob_2' as BlobId)
+    expect(restored.usedEventBindings?.get('evt_sess_bind_0' as EventId)).toBe('blob_0' as BlobId)
+  })
+
+  it('appends one line per incremental binding to the log', () => {
+    const dir = tempDir()
+    const store = new DiskSessionStore(dir)
+    const base = record('rev-1' as SessionRevision, 'sess_bind' as SessionId)
+    store.putSession(base)
+    store.commit(
+      'sess_bind' as SessionId,
+      { ...base, revision: 'rev-2' as SessionRevision, usedEventBindings: new Map([['evt_sess_bind_0' as EventId, 'blob_0' as BlobId]]) },
+      'rev-1' as SessionRevision,
+      new Map([['evt_sess_bind_0' as EventId, 'blob_0' as BlobId]]),
+    )
+    const log = readFileSync(join(dir, 'bindings', 'sess_bind.log'), 'utf8')
+    expect(log.trim().split('\n')).toHaveLength(1)
+  })
+
+  it('recovers a legacy record file that embeds the binding table', () => {
+    const dir = tempDir()
+    // A pre-binding-log record file embeds usedEventBindings; the rebuild
+    // merges it into the in-memory table.
+    const dir2 = tempDir()
+    const store = new DiskSessionStore(dir2)
+    store.putSession({
+      ...record('rev-1' as SessionRevision, 'sess_legacy' as SessionId),
+      usedEventBindings: new Map([['evt_sess_legacy_0' as EventId, 'blob_0' as BlobId]]),
+    })
+    void dir
+    const rebuilt = new DiskSessionStore(dir2)
+    expect(rebuilt.getSession('sess_legacy' as SessionId)!.usedEventBindings?.get('evt_sess_legacy_0' as EventId)).toBe('blob_0' as BlobId)
+  })
+})

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { fromEntries, SessionTree, toArray } from '../src/btree.ts'
-import { loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
+import { appendEntryToTree, loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
 import { encodePage } from '../src/pages.ts'
 import { PageStore } from '../src/page-store.ts'
 import type { BlobId, EventId, PageId } from '../src/index.ts'
@@ -282,5 +282,54 @@ describe('multi-page B+Tree', () => {
       children: [],
     })))
     expect(() => loadMultiPageTree(store, root)).toThrow(/invalid internal page/)
+  })
+})
+
+describe('appendEntryToTree', () => {
+  it('appends into the rightmost leaf and matches the in-memory tree', () => {
+    const store = new PageStore()
+    let root = saveMultiPageTree(store, undefined)
+    for (let i = 0; i < 7; i++) root = appendEntryToTree(store, root, eventId(i), blobId(i))
+    const loaded = toArray(loadMultiPageTree(store, root))
+    expect(loaded.map(entry => entry.eventId)).toEqual([0, 1, 2, 3, 4, 5, 6].map(eventId))
+    expect(loaded.map(entry => entry.order)).toEqual([0, 1, 2, 3, 4, 5, 6])
+  })
+
+  it('splits a full leaf into two sibling leaves', () => {
+    const store = new PageStore()
+    let root = saveMultiPageTree(store, undefined)
+    // MAX_ENTRIES = 4: the fifth append splits the leaf; the empty seed leaf
+    // is unreachable from the new root.
+    for (let i = 0; i < 5; i++) root = appendEntryToTree(store, root, eventId(i), blobId(i))
+    expect(toArray(loadMultiPageTree(store, root))).toHaveLength(5)
+    // The split produced an internal root over two leaves (copy-on-write
+    // pages accumulate, so the store holds the seed leaf plus the path
+    // copies).
+    const rootNode = loadMultiPageTree(store, root)
+    expect(rootNode?.kind).toBe('internal')
+    expect(store.size).toBeGreaterThanOrEqual(4)
+  })
+
+  it('splits internal nodes and the root, staying loadable', () => {
+    const store = new PageStore()
+    let root = saveMultiPageTree(store, undefined)
+    let tree = SessionTree.empty()
+    for (let i = 0; i < 25; i++) {
+      root = appendEntryToTree(store, root, eventId(i), blobId(i))
+      tree = tree.append(eventId(i), blobId(i))
+    }
+    const loaded = toArray(loadMultiPageTree(store, root))
+    expect(loaded).toHaveLength(25)
+    expect(loaded.map(entry => entry.eventId)).toEqual(tree.entries().map(entry => entry.eventId))
+    expect(loaded.map(entry => entry.order)).toEqual(Array.from({ length: 25 }, (_, i) => i))
+  })
+
+  it('rejects an order that cannot advance past the number ceiling', () => {
+    const store = new PageStore()
+    // 2^53 is the first order whose successor equals itself in IEEE-754.
+    const ceiling = 2 ** 53
+    const leaf = { kind: 'leaf' as const, entries: [{ order: ceiling, eventId: eventId(0), blobId: blobId(0) }] }
+    const root = store.writePage(new TextEncoder().encode(JSON.stringify(leaf)))
+    expect(() => appendEntryToTree(store, root, eventId(1), blobId(1))).toThrow(/full renumber/)
   })
 })

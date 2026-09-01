@@ -11,7 +11,7 @@
 
 import { SessionTree } from './btree.ts'
 import type { CompactionInput } from './compaction.ts'
-import { parseRevision, SessionFormatEngine } from './engine.ts'
+import { nextRevision, parseRevision, SessionFormatEngine } from './engine.ts'
 import type { SessionFile } from './file.ts'
 import type { BlobId, CompactionSummary, EventId, PageId, SessionId, SessionRevision, StoredSessionRecord } from './index.ts'
 import { projectionNeedsRebuild } from './projection.ts'
@@ -44,8 +44,8 @@ export type NewSessionFile = Omit<SessionFile, 'session'> & {
  * @param sessionId - the session the new event belongs to.
  * @returns the minted EventId and the numeric counter it carries.
  */
-function nextEventId(file: SessionFile, sessionId: SessionId): { id: EventId; counter: number } {
-  const counter = file.session.nextEventCounter
+function nextEventId(record: StoredSessionRecord, sessionId: SessionId): { id: EventId; counter: number } {
+  const counter = record.nextEventCounter
   if (counter >= Number.MAX_SAFE_INTEGER) {
     throw new Error('event counter cannot advance within the safe integer range')
   }
@@ -76,8 +76,8 @@ function blobNumeric(id: BlobId): number | undefined {
  * @param file - the current session file.
  * @returns a BlobId above every id the session has used.
  */
-function nextBlobId(file: SessionFile): BlobId {
-  const next = file.session.blobIdWatermark ?? -1
+function nextBlobId(record: StoredSessionRecord): BlobId {
+  const next = record.blobIdWatermark ?? -1
   if (next >= Number.MAX_SAFE_INTEGER) {
     throw new Error('session blob counter cannot advance within the safe integer range')
   }
@@ -123,26 +123,6 @@ function calibrateHighWatermarks(file: NewSessionFile): { nextEventCounter: numb
     nextEventCounter: counter,
     ...(watermark < 0 ? {} : { blobIdWatermark: watermark }),
   }
-}
-
-/**
- * The revision following a given one.
- * @param revision - the current revision, in the `rev-<n>` form.
- * @returns the next revision.
- */
-function nextRevision(revision: SessionRevision): SessionRevision {
-  const current = parseRevision(revision)
-  // Stored revisions are always advanceable safe-integer tokens (createSession
-  // and the engine validate them), so only the ceiling advance is reachable.
-  /* v8 ignore next 1 -- defensive: stored revisions always parse as safe tokens */
-  if (current === undefined) throw new Error(`revision ${revision} is not a rev-<n> token`)
-  // A registered session always advances at least once (createSession rejects
-  // ceiling revisions); this guard stops a session that has reached the
-  // ceiling revision from minting a token no later commit can advance.
-  if (current >= Number.MAX_SAFE_INTEGER - 1) {
-    throw new Error(`revision ${revision} cannot advance within the safe integer range`)
-  }
-  return `rev-${current + 1}` as SessionRevision
 }
 
 /** Application-facing repository for the new session format. */
@@ -219,40 +199,35 @@ export class SessionRepository {
 
   /**
    * Append one event with its payload. The EventId and BlobId are assigned by
-   * the repository, the revision is advanced, and the new root is published
-   * through the engine's compare-and-swap commit.
+   * the repository from the persisted high-water marks, and the new root is
+   * published through the engine's incremental compare-and-swap commit, which
+   * copies only the rightmost tree path and appends one blob-map page, so the
+   * operation costs O(log n) in the session size instead of rewriting the
+   * whole snapshot.
    * @param sessionId - the session to append to.
    * @param payload - the event payload bytes.
    * @returns the committed session record, or undefined when a concurrent
    * writer advanced the session first.
    */
   append(sessionId: SessionId, payload: Uint8Array): StoredSessionRecord | undefined {
-    const file = this.engine.loadSession(sessionId)
-    const { id: eventId, counter } = nextEventId(file, sessionId)
-    const blobId = nextBlobId(file)
+    const record = this.engine.record(sessionId)
+    if (record === undefined) throw new Error(`session ${sessionId} not found`)
+    const { id: eventId, counter } = nextEventId(record, sessionId)
+    const blobId = nextBlobId(record)
     const watermark = blobNumeric(blobId)
     // nextBlobId only mints canonical `blob_<n>` ids, so the fallback branch
     // is unreachable through the repository.
     /* v8 ignore next 1 -- defensive: nextBlobId only mints canonical blob_<n> ids */
     if (watermark === undefined) throw new Error('session blob id watermark must be numeric')
-    const session = {
-      ...file.session,
-      blobIdWatermark: watermark,
-      nextEventCounter: counter + 1,
-    }
-    const tree = SessionTree.fromEntries(file.entries).append(eventId, blobId)
-    const blobs = new Map(file.blobs)
-    blobs.set(blobId, payload)
-    const nextFile: SessionFile = {
-      ...file,
-      session: { ...session, revision: nextRevision(file.session.revision) },
-      entries: tree.entries(),
-      blobs,
-    }
-    // The loaded file is passed as the previous generation so the commit
-    // skips its own second full load and checks blob immutability against the
-    // in-memory map instead of re-reading every rolling backup's blob page.
-    return this.engine.commitSession(nextFile, file.session.revision, file)
+    return this.engine.commitAppend(
+      sessionId,
+      eventId,
+      blobId,
+      counter + 1,
+      watermark,
+      payload,
+      record.revision,
+    )
   }
 
   /**

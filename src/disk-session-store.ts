@@ -11,7 +11,7 @@
  * @module @deepseek-ai/dsh-session-format/disk-session-store
  */
 
-import { mkdirSync, readdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { writeFileAtomicDurableSync } from './atomic-write-sync.ts'
 import type { BlobId, EventId, PageId, SessionId, SessionRevision, StoredSessionBackup, StoredSessionRecord } from './index.ts'
@@ -21,11 +21,17 @@ export const DEFAULT_MAX_BACKUP_GENERATIONS = 3
 
 const RECORDS_DIR = 'records'
 const RECORD_FILE_SUFFIX = '.json'
+const BINDINGS_DIR = 'bindings'
+const BINDINGS_FILE_SUFFIX = '.log'
 
-/** One persisted per-session file: the record plus its used-revision ABA set. */
+/** One persisted per-session file: the record plus its used-revision ABA set.
+ * `legacyBindings` carries a binding table embedded in a pre-binding-log
+ * record file, merged into the binding log on load.
+ */
 interface PersistedSession {
   readonly record: StoredSessionRecord
   readonly usedRevisions: readonly SessionRevision[]
+  readonly legacyBindings?: ReadonlyMap<EventId, BlobId>
 }
 
 /** Serialize a record into a JSON-safe shape, expanding the binding map. */
@@ -48,9 +54,9 @@ function serializeRecord(record: StoredSessionRecord): Record<string, unknown> {
     ...(record.referencesPage === undefined ? {} : { referencesPage: record.referencesPage }),
     ...(record.compactedPage === undefined ? {} : { compactedPage: record.compactedPage }),
     ...(record.blobIdWatermark === undefined ? {} : { blobIdWatermark: record.blobIdWatermark }),
-    ...(record.usedEventBindings === undefined
-      ? {}
-      : { usedEventBindings: [...record.usedEventBindings].map(([eventId, blobId]) => [eventId, blobId]) }),
+    // usedEventBindings is not embedded in the record file: the binding table
+    // lives in the per-session binding log so record writes stay O(1) (an
+    // append writes one log line instead of the whole table).
   }
   return serialized
 }
@@ -97,14 +103,14 @@ function parsePersistedSession(path: string, raw: string): PersistedSession {
     throw new Error(`session record file ${path} must carry a usedRevisions string array`)
   }
   const usedEventBindingsRaw = recordFields.usedEventBindings
-  let usedEventBindings: ReadonlyMap<EventId, BlobId> | undefined
+  let legacyBindings: ReadonlyMap<EventId, BlobId> | undefined
   if (usedEventBindingsRaw !== undefined) {
     if (!Array.isArray(usedEventBindingsRaw)
       || usedEventBindingsRaw.some(pair => !Array.isArray(pair) || pair.length !== 2
         || typeof pair[0] !== 'string' || typeof pair[1] !== 'string')) {
       throw new Error(`session record file ${path} must carry a binding pair array`)
     }
-    usedEventBindings = new Map(usedEventBindingsRaw.map((pair: unknown[]) => [pair[0], pair[1]] as [EventId, BlobId]))
+    legacyBindings = new Map(usedEventBindingsRaw.map((pair: unknown[]) => [pair[0], pair[1]] as [EventId, BlobId]))
   }
   const parsedRecord: StoredSessionRecord = {
     sessionId: recordFields.sessionId as SessionId,
@@ -124,11 +130,11 @@ function parsePersistedSession(path: string, raw: string): PersistedSession {
     ...optionalNumberField(recordFields, path, 'createdAt'),
     ...optionalNumberField(recordFields, path, 'delegationDepth'),
     ...optionalNumberField(recordFields, path, 'blobIdWatermark'),
-    ...(usedEventBindings === undefined ? {} : { usedEventBindings }),
   }
   return {
     record: parsedRecord,
     usedRevisions: usedRevisions as SessionRevision[],
+    ...(legacyBindings === undefined ? {} : { legacyBindings }),
   }
 }
 
@@ -205,8 +211,13 @@ function copyRecord(record: StoredSessionRecord): StoredSessionRecord {
 export class DiskSessionStore {
   private readonly rootDir: string
   private readonly recordsDir: string
+  private readonly bindingsDir: string
   private readonly records = new Map<SessionId, StoredSessionRecord>()
   private readonly usedRevisions = new Map<SessionId, Set<SessionRevision>>()
+  /** The session's used-bindings table, rebuilt from the binding log at open
+   * and extended incrementally on commit, so append stays O(log n) instead of
+   * rewriting the table into the record file. */
+  private readonly bindings = new Map<SessionId, Map<EventId, BlobId>>()
 
   /**
    * Open (or create) a session store rooted at `rootDir`. Existing record
@@ -224,7 +235,9 @@ export class DiskSessionStore {
     }
     this.rootDir = rootDir
     this.recordsDir = join(rootDir, RECORDS_DIR)
+    this.bindingsDir = join(rootDir, BINDINGS_DIR)
     mkdirSync(this.recordsDir, { recursive: true })
+    mkdirSync(this.bindingsDir, { recursive: true })
     for (const name of readdirSync(this.recordsDir)) {
       if (!name.endsWith(RECORD_FILE_SUFFIX)) {
         throw new Error(`unexpected file in session record directory: ${name}`)
@@ -235,7 +248,16 @@ export class DiskSessionStore {
       if (this.records.has(sessionId)) {
         throw new Error(`duplicate session record for ${sessionId}`)
       }
-      this.records.set(sessionId, copyRecord(persisted.record))
+      // The binding table is restored from the append-only binding log; a
+      // pre-binding-log record file may still embed the table, which is merged
+      // in and persisted to the log on the first write.
+      const bindings = readBindings(this.bindingPath(sessionId))
+      for (const [eventId, blobId] of persisted.legacyBindings ?? []) {
+        if (!bindings.has(eventId)) bindings.set(eventId, blobId)
+      }
+      const { usedEventBindings: _legacy, ...rest } = persisted.record
+      this.records.set(sessionId, copyRecord(rest))
+      this.bindings.set(sessionId, bindings)
       this.usedRevisions.set(sessionId, new Set(persisted.usedRevisions))
     }
   }
@@ -257,7 +279,11 @@ export class DiskSessionStore {
     const next: StoredSessionRecord = { ...stored, backups: trimmed }
     const used = new Set<SessionRevision>([record.revision])
     writePersisted(this.recordPath(record.sessionId), next, used)
-    this.records.set(record.sessionId, copyRecord(next))
+    // Registration writes the whole binding table to the log atomically.
+    writeBindings(this.bindingPath(record.sessionId), record.usedEventBindings ?? new Map())
+    const { usedEventBindings: table, ...rest } = next
+    this.records.set(record.sessionId, copyRecord(rest))
+    this.bindings.set(record.sessionId, new Map(record.usedEventBindings ?? []))
     this.usedRevisions.set(record.sessionId, used)
   }
 
@@ -266,6 +292,19 @@ export class DiskSessionStore {
    * @returns a defensive copy of the record, or undefined when absent.
    */
   getSession(sessionId: SessionId): StoredSessionRecord | undefined {
+    const record = this.records.get(sessionId)
+    if (record === undefined) return undefined
+    const table = this.bindings.get(sessionId)
+    return copyRecord(table === undefined ? record : { ...record, usedEventBindings: new Map(table) })
+  }
+
+  /** Read a session record without assembling its used-bindings table.
+   * Append paths need only the control fields (root, revision, counters,
+   * page pointers), so this read stays O(1) in the binding count.
+   * @param sessionId - session id to read.
+   * @returns the stored record without its binding table, or undefined when absent.
+   */
+  getRecord(sessionId: SessionId): StoredSessionRecord | undefined {
     const record = this.records.get(sessionId)
     return record === undefined ? undefined : copyRecord(record)
   }
@@ -288,7 +327,12 @@ export class DiskSessionStore {
    * @param expectedRevision - revision the commit is compared against.
    * @returns true when the commit landed, false when the expected revision was stale.
    */
-  commit(sessionId: SessionId, next: StoredSessionRecord, expectedRevision: SessionRevision): boolean {
+  commit(
+    sessionId: SessionId,
+    next: StoredSessionRecord,
+    expectedRevision: SessionRevision,
+    additionalBindings?: ReadonlyMap<EventId, BlobId>,
+  ): boolean {
     const current = this.records.get(sessionId)
     const used = this.usedRevisions.get(sessionId)
     if (next.sessionId !== sessionId
@@ -307,8 +351,12 @@ export class DiskSessionStore {
       || next.nextEventCounter < current.nextEventCounter
       // The EventId binding table is monotonic: every binding in the current
       // record must survive into the next with the same blob, or a commit
-      // could silently rewrite EventId history and let a later rebind pass.
-      || !bindingMonotonic(current.usedEventBindings, next.usedEventBindings)) {
+      // could silently rewrite EventId history and let a later rebind pass. An
+      // incremental commit (additionalBindings present) appends to the table
+      // and the binding log instead and only rejects a conflicting append.
+      || (additionalBindings !== undefined
+        ? !bindingsAppendable(this.bindings.get(sessionId), additionalBindings)
+        : !bindingMonotonic(this.bindings.get(sessionId), next.usedEventBindings))) {
       return false
     }
     const backup: StoredSessionBackup = {
@@ -320,12 +368,34 @@ export class DiskSessionStore {
     }
     const nextUsed = new Set(used)
     nextUsed.add(next.revision)
+    // The binding table is extended in place: the monotonicity checks above
+    // already rejected any conflicting rebind, so appending the added
+    // bindings costs O(added) instead of copying the whole table.
+    let nextBindings = this.bindings.get(sessionId)
+    if (nextBindings === undefined) {
+      nextBindings = new Map()
+      this.bindings.set(sessionId, nextBindings)
+    }
+    for (const [eventId, blobId] of additionalBindings ?? next.usedEventBindings ?? []) {
+      nextBindings.set(eventId, blobId)
+    }
+    const { usedEventBindings: _table, ...rest } = next
     const nextRecord: StoredSessionRecord = {
-      ...next,
-      ...(next.usedEventBindings === undefined ? {} : { usedEventBindings: new Map(next.usedEventBindings) }),
+      ...rest,
       backups: trimBackups([...current.backups, backup], this.maxBackupGenerations),
     }
     writePersisted(this.recordPath(sessionId), nextRecord, nextUsed)
+    // The record file is written first; the binding log then receives the
+    // newly added bindings. A crash between the two leaves the table short of
+    // the newest live bindings, which the tree carries anyway, so the ABA and
+    // rebind guards stay intact. An incremental commit appends one line per
+    // new binding; a whole-snapshot commit (no additionalBindings) rewrites
+    // the log from the next table.
+    if (additionalBindings !== undefined && additionalBindings.size > 0) {
+      appendBindings(this.bindingPath(sessionId), additionalBindings)
+    } else {
+      writeBindings(this.bindingPath(sessionId), next.usedEventBindings ?? new Map())
+    }
     this.records.set(sessionId, copyRecord(nextRecord))
     this.usedRevisions.set(sessionId, nextUsed)
     return true
@@ -340,6 +410,63 @@ export class DiskSessionStore {
 
   private recordPath(sessionId: SessionId): string {
     return join(this.recordsDir, `${sessionId}${RECORD_FILE_SUFFIX}`)
+  }
+
+  private bindingPath(sessionId: SessionId): string {
+    return join(this.bindingsDir, `${sessionId}${BINDINGS_FILE_SUFFIX}`)
+  }
+}
+
+/** Read every binding from an append-only binding log.
+ * A missing log is an empty table (a session registered without bindings).
+ * @param path - binding log file path.
+ * @returns the reconstructed binding table.
+ */
+function readBindings(path: string): Map<EventId, BlobId> {
+  const bindings = new Map<EventId, BlobId>()
+  let raw: string
+  try {
+    raw = readFileSync(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return bindings
+    throw error
+  }
+  for (const line of raw.split('\n')) {
+    if (line === '') continue
+    const tab = line.indexOf('\t')
+    if (tab < 0) throw new Error(`corrupt binding log line: ${line}`)
+    const eventId = JSON.parse(line.slice(0, tab)) as unknown
+    const blobId = JSON.parse(line.slice(tab + 1)) as unknown
+    if (typeof eventId !== 'string' || typeof blobId !== 'string') {
+      throw new Error(`corrupt binding log line: ${line}`)
+    }
+    bindings.set(eventId as EventId, blobId as BlobId)
+  }
+  return bindings
+}
+
+/** Atomically replace a binding log with the complete table.
+ * @param path - binding log file path.
+ * @param bindings - complete binding table to persist.
+ */
+function writeBindings(path: string, bindings: ReadonlyMap<EventId, BlobId>): void {
+  const lines = [...bindings].map(([eventId, blobId]) => `${JSON.stringify(eventId)}\t${JSON.stringify(blobId)}\n`).join('')
+  writeFileAtomicDurableSync(path, new TextEncoder().encode(lines), 0o600)
+}
+
+/** Append bindings to a binding log with an fsync, so an incremental commit
+ * persists the new lines before the in-memory state advances.
+ * @param path - binding log file path.
+ * @param bindings - bindings to append.
+ */
+function appendBindings(path: string, bindings: ReadonlyMap<EventId, BlobId>): void {
+  const lines = [...bindings].map(([eventId, blobId]) => `${JSON.stringify(eventId)}\t${JSON.stringify(blobId)}\n`).join('')
+  const fd = openSync(path, 'a', 0o600)
+  try {
+    appendFileSync(fd, lines)
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
   }
 }
 
@@ -375,6 +502,24 @@ function bindingMonotonic(
   if (current === undefined) return true
   for (const [eventId, blobId] of current) {
     if (next?.get(eventId) !== blobId) return false
+  }
+  return true
+}
+
+/** Whether appending bindings to the current table never rebinds an existing
+ * EventId to a different blob. The incremental append path mints fresh ids,
+ * so the check is O(added); a conflict marks a hand-built caller input.
+ * @param current - the current binding table, or undefined when absent.
+ * @param added - bindings this commit adds.
+ * @returns true when every added binding is new or unchanged.
+ */
+function bindingsAppendable(
+  current: ReadonlyMap<EventId, BlobId> | undefined,
+  added: ReadonlyMap<EventId, BlobId>,
+): boolean {
+  for (const [eventId, blobId] of added) {
+    const prior = current?.get(eventId)
+    if (prior !== undefined && prior !== blobId) return false
   }
   return true
 }

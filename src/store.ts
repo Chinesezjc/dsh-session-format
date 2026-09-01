@@ -12,6 +12,11 @@ export const DEFAULT_MAX_BACKUP_GENERATIONS = 3
 export class SessionStore {
   private readonly records = new Map<SessionId, StoredSessionRecord>()
   private readonly usedRevisions = new Map<SessionId, Set<SessionRevision>>()
+  /** The session's used-bindings table, owned by the store and extended
+   * incrementally: an append adds its new binding to this map in O(1) instead
+   * of copying the whole table into the record, so append stays O(log n).
+   * `records` carries the same table for whole-snapshot commits. */
+  private readonly bindings = new Map<SessionId, Map<EventId, BlobId>>()
 
   constructor(private readonly maxBackupGenerations = DEFAULT_MAX_BACKUP_GENERATIONS) {
     // A fractional cap would truncate the splice count and silently retain
@@ -42,7 +47,9 @@ export class SessionStore {
     else if (backups.length > this.maxBackupGenerations) {
       backups = backups.slice(backups.length - this.maxBackupGenerations)
     }
-    this.records.set(stored.sessionId, { ...stored, backups })
+    const { usedEventBindings: table, ...rest } = stored
+    this.bindings.set(stored.sessionId, new Map(table ?? []))
+    this.records.set(stored.sessionId, { ...rest, backups })
     this.markUsed(stored.sessionId, stored.revision)
   }
 
@@ -51,6 +58,19 @@ export class SessionStore {
    * @returns a defensive copy of the record, or undefined when absent.
    */
   getSession(sessionId: SessionId): StoredSessionRecord | undefined {
+    const record = this.records.get(sessionId)
+    if (record === undefined) return undefined
+    const table = this.bindings.get(sessionId)
+    return copyRecord(table === undefined ? record : { ...record, usedEventBindings: new Map(table) })
+  }
+
+  /** Read a session record without assembling its used-bindings table.
+   * Append paths need only the control fields (root, revision, counters,
+   * page pointers), so this read stays O(1) in the binding count.
+   * @param sessionId - session id to read.
+   * @returns the stored record without its binding table, or undefined when absent.
+   */
+  getRecord(sessionId: SessionId): StoredSessionRecord | undefined {
     const record = this.records.get(sessionId)
     return record === undefined ? undefined : copyRecord(record)
   }
@@ -65,13 +85,24 @@ export class SessionStore {
   /** Commit a replacement record only when the expected revision still matches.
    * The full previous generation (every page pointer) is appended to the
    * rolling backups on success; this store is the sole owner of backup
-   * bookkeeping.
+   * bookkeeping. `additionalBindings` names the bindings this commit adds to
+   * the session's used-bindings table; the in-memory store already carries
+   * them inside `next.usedEventBindings`, so it ignores the argument (the
+   * durable store appends them to its binding log to keep record writes
+   * O(1)).
    * @param sessionId - session to commit.
    * @param next - replacement record.
    * @param expectedRevision - revision the commit is compared against.
+   * @param additionalBindings - bindings newly added by this commit, used by
+   * durable backends to persist the binding table incrementally.
    * @returns true when the commit landed, false when the expected revision was stale.
    */
-  commit(sessionId: SessionId, next: StoredSessionRecord, expectedRevision: SessionRevision): boolean {
+  commit(
+    sessionId: SessionId,
+    next: StoredSessionRecord,
+    expectedRevision: SessionRevision,
+    additionalBindings?: ReadonlyMap<EventId, BlobId>,
+  ): boolean {
     const current = this.records.get(sessionId)
     // The replacement must advance the revision: accepting an unchanged token
     // would let a stale snapshot commit again over a newer state.
@@ -89,8 +120,13 @@ export class SessionStore {
       || next.nextEventCounter < current.nextEventCounter
       // The EventId binding table is monotonic: every binding in the current
       // record must survive into the next with the same blob, or a commit
-      // could silently rewrite EventId history and let a later rebind pass.
-      || !bindingMonotonic(current.usedEventBindings, next.usedEventBindings)) {
+      // could silently rewrite EventId history and let a later rebind pass. An
+      // incremental commit (additionalBindings present) appends to the store's
+      // table instead and only rejects a conflicting append; a whole-snapshot
+      // commit checks the full monotonicity.
+      || (additionalBindings !== undefined
+        ? !bindingsAppendable(this.bindings.get(sessionId), additionalBindings)
+        : !bindingMonotonic(this.bindings.get(sessionId), next.usedEventBindings))) {
       return false
     }
     const backup: StoredSessionBackup = {
@@ -107,11 +143,19 @@ export class SessionStore {
     else if (backups.length > this.maxBackupGenerations) {
       backups.splice(0, backups.length - this.maxBackupGenerations)
     }
-    this.records.set(sessionId, {
-      ...next,
-      ...(next.usedEventBindings === undefined ? {} : { usedEventBindings: new Map(next.usedEventBindings) }),
-      backups,
-    })
+    // The binding table is extended in place: the monotonicity checks above
+    // already rejected any conflicting rebind, so appending the added
+    // bindings costs O(added) instead of copying the whole table.
+    let nextBindings = this.bindings.get(sessionId)
+    if (nextBindings === undefined) {
+      nextBindings = new Map()
+      this.bindings.set(sessionId, nextBindings)
+    }
+    for (const [eventId, blobId] of additionalBindings ?? next.usedEventBindings ?? []) {
+      nextBindings.set(eventId, blobId)
+    }
+    const { usedEventBindings: _table, ...rest } = next
+    this.records.set(sessionId, { ...rest, backups })
     this.markUsed(sessionId, next.revision)
     return true
   }
@@ -148,6 +192,24 @@ function bindingMonotonic(
   if (current === undefined) return true
   for (const [eventId, blobId] of current) {
     if (next?.get(eventId) !== blobId) return false
+  }
+  return true
+}
+
+/** Whether appending bindings to the current table never rebinds an existing
+ * EventId to a different blob. The incremental append path mints fresh ids,
+ * so the check is O(added); a conflict marks a hand-built caller input.
+ * @param current - the current binding table, or undefined when absent.
+ * @param added - bindings this commit adds.
+ * @returns true when every added binding is new or unchanged.
+ */
+function bindingsAppendable(
+  current: ReadonlyMap<EventId, BlobId> | undefined,
+  added: ReadonlyMap<EventId, BlobId>,
+): boolean {
+  for (const [eventId, blobId] of added) {
+    const prior = current?.get(eventId)
+    if (prior !== undefined && prior !== blobId) return false
   }
   return true
 }
