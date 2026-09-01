@@ -1,0 +1,4 @@
+# dsh-session-format-sync bundle patch: mount the sync plugin.
+- insert:
+    - id: session-format-sync
+      name: dsh-session-format-sync
