@@ -45,6 +45,7 @@ kind: "package-library"
 - `src/btree.ts` — 内存 Copy-on-Write B+Tree 与 `SessionTree` 门面。
 - `src/file.ts` — 带 durable 边界校验的自包含 session 文件序列化，通过原子文件存储持久化。
 - `src/file-store.ts` — 原子持久文件写入与 checksum 快照容器。
+- `src/disk-page-store.ts` — 持久化页存储：目录下每页一个 checksum 页文件，带持久化 next-id 水位，可从目录重建恢复。
 - `src/compaction.ts` — 物理压缩事务：显式 surface 事件移除、引用重定向与被遮蔽 blob 回收。
 - `src/projection.ts` — EventId watermark 投影状态、折叠与一次性 shadowed 区间重建判定（投影须为压缩前状态）。
 - `src/fork.ts` — 按 `EventId` fork，继承前缀的 blobs、references 与压缩摘要。
@@ -83,8 +84,8 @@ kind: "package-library"
 <a id="known-limitations-and-deferred-work"></a>
 ## 已知限制与延期工作
 
-- **仅内存原型** —— B+Tree 尚未由持久化多页文件格式支撑。
-- **仓库基于内存存储** —— `SessionRepository` 通过 `SessionFormatEngine` 组合内存 `PageStore`/`SessionStore`；接入 durable `file-store.ts` 快照延期。
+- **仅内存原型** —— 内存 B+Tree 尚未由单一 durable 多页文件格式支撑；`DiskPageStore` 改为目录下每页一个文件持久化。
+- **仓库基于内存存储** —— `SessionRepository` 通过 `SessionFormatEngine` 组合内存 `PageStore`/`SessionStore`；接入 durable `file-store.ts` 快照延期。`DiskPageStore` 与 `PageStore` 接口可直接互换，引擎现在即可跑在磁盘页之上；session 记录存储（revision CAS、备份）仍为内存。
 - **append 线性扫描 id** —— `append` 扫描事件列表与 blob map 以推进事件计数器与 blob watermark，且每次提交都会重读当前 blob map 与全部滚动备份的 blob map 以校验不可变性，无界 session 的每次追加为 O(n)；持久化计数器或索引延期。
 - **底层提交点信任调用方** —— 直接调用 `engine.commitSession`/`engine.compact` 可传入降低的 blob watermark 或上限 revision；仓库路径总是派生递增值，未来变更可能在提交点统一强制。
 - **存储契约仅限 JSDoc** —— 页/blob 不可变、create-only 写入与 CAS 铸造 revision 都是接口契约，尚无后端实现，也没有按 revision 固定的读取句柄来防止并发 GC 回收页。

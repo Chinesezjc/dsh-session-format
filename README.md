@@ -45,6 +45,7 @@ The package currently contains:
 - `src/btree.ts` — in-memory Copy-on-Write B+Tree and the `SessionTree` facade.
 - `src/file.ts` — self-contained session file serialization with durable-boundary validation, persisted through the atomic file store.
 - `src/file-store.ts` — atomic durable file writes and the checksummed snapshot container.
+- `src/disk-page-store.ts` — durable page store: one checksummed page file per page under a directory, with a persisted next-id watermark and rebuild-from-directory resume.
 - `src/compaction.ts` — physical compaction transaction: explicit surface-event removal, reference redirect, and shadowed-blob reclamation.
 - `src/projection.ts` — EventId watermark projection state, fold, and the one-shot shadowed-range rebuild check (the projection must be the pre-compaction state).
 - `src/fork.ts` — fork by `EventId` with prefix-inherited blobs, references, and compaction summaries.
@@ -81,8 +82,8 @@ No direct effect; cache behavior is owned by the persistence provider that consu
 
 ## Known Limitations and Deferred Work
 
-- **In-memory prototype only** — the B+Tree is not yet backed by a durable multi-page file format.
-- **Repository over in-memory stores** — `SessionRepository` composes the in-memory `PageStore`/`SessionStore` through `SessionFormatEngine`; wiring it to the durable `file-store.ts` snapshots is deferred.
+- **In-memory prototype only** — the in-memory B+Tree is not yet backed by a single durable multi-page file format; `DiskPageStore` persists one page file per page instead.
+- **Repository over in-memory stores** — `SessionRepository` composes the in-memory `PageStore`/`SessionStore` through `SessionFormatEngine`; wiring it to the durable `file-store.ts` snapshots is deferred. `DiskPageStore` is drop-in compatible with the `PageStore` surface, so the engine can run over disk-backed pages today; the session record store (revision CAS, backups) remains in-memory.
 - **Linear id scans on append** — `append` scans the event list and blob map to advance the event counter and blob watermark, and each commit re-reads the current blob map plus every rolling backup's blob map to verify immutability, so appending to an unbounded session is O(n) per call; a persisted counter or index is deferred.
 - **Low-level commit points trust the caller** — direct `engine.commitSession`/`engine.compact` calls can supply a lowered blob watermark or a ceiling revision; the repository path always derives advancing values, and a future change may enforce both at the commit point.
 - **Storage contract is JSDoc-only** — page/blob immutability, create-only writes, and CAS-minted revisions are interface contracts; no backend implements them yet, and there is no revision-bound read handle that pins pages against concurrent GC.
