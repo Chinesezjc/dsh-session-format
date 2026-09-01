@@ -97,12 +97,8 @@ export function collectGarbage(store: PageStore, sessions: Iterable<StoredSessio
     }
   }
   for (const session of sessions) visitRecord(session)
-  let removed = 0
-  for (const pageId of store.pageIds()) {
-    if (!reachable.has(pageId)) {
-      store.deletePage(pageId)
-      removed += 1
-    }
-  }
-  return removed
+  // The sweep converges on the store's retain contract: the in-memory store
+  // drops the unreachable pages, the durable segment store compacts the
+  // segment to the reachable set.
+  return store.retain(reachable)
 }

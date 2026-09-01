@@ -58,7 +58,11 @@ describe('DiskPageStore', () => {
     const store = new DiskPageStore(dir)
     const first = store.writePage(new TextEncoder().encode('a'))
     const second = store.writePage(new TextEncoder().encode('b'))
-    store.deletePage(first)
+    store.flush()
+    // Physical reclamation happens at the segment compaction (the GC entry
+    // point): retain drops the unreachable page and rewrites the segment, so a
+    // rebuild no longer revives it.
+    expect(store.retain(new Set([second]))).toBe(1)
     const rebuilt = new DiskPageStore(dir)
     const third = rebuilt.writePage(new TextEncoder().encode('c'))
     expect(third).not.toBe(first)
@@ -68,13 +72,14 @@ describe('DiskPageStore', () => {
   })
 
   it('does not let a missing watermark file lower the next id below scanned pages', () => {
-    // A crash between a page write and its watermark update leaves the page
-    // file on disk with no meta.json; the rebuild must resume past the scanned
-    // maximum instead of reusing the orphaned page id.
+    // A crash between a flush and the segment's next write leaves the pages on
+    // disk with no meta.json; the rebuild must resume past the scanned maximum
+    // instead of reusing the orphaned page id.
     const dir = tempDir()
     const store = new DiskPageStore(dir)
     const pageId = store.writePage(new TextEncoder().encode('a'))
-    // Simulate the crash window: page file present, watermark file absent.
+    store.flush()
+    // Simulate the crash window: page bytes present, watermark file absent.
     rmSync(join(dir, 'meta.json'))
     const rebuilt = new DiskPageStore(dir)
     expect(rebuilt.pageIds()).toEqual([pageId])
@@ -87,9 +92,14 @@ describe('DiskPageStore', () => {
     const dir = tempDir()
     const store = new DiskPageStore(dir)
     store.writePage(new TextEncoder().encode('a'))
-    // A page written behind the store's back (watermark still 1) must not be
-    // overwritten: the rebuild scans it and advances past it.
-    writeFileSync(join(dir, 'pages', 'page_3.page'), encodePage('page_3' as PageId, new TextEncoder().encode('manual')))
+    store.flush()
+    // A page appended to the segment behind the store's back (watermark stale)
+    // must not be overwritten: the rebuild decodes it and advances past it.
+    const manual = encodePage('page_3' as PageId, new TextEncoder().encode('manual'))
+    const entry = new Uint8Array(4 + manual.length)
+    new DataView(entry.buffer).setUint32(0, manual.length, false)
+    entry.set(manual, 4)
+    writeFileSync(join(dir, 'pages.bin'), entry, { flag: 'a' })
     const rebuilt = new DiskPageStore(dir)
     expect(rebuilt.pageIds()).toContain('page_3' as PageId)
     expect(new TextDecoder().decode(rebuilt.readPage('page_3' as PageId))).toBe('manual')
@@ -116,23 +126,18 @@ describe('DiskPageStore', () => {
     expect(store.pageIds()).toEqual([second])
   })
 
-  it('rejects a page file whose stored id differs from the requested id', () => {
+  it('rejects a corrupt segment entry inside the watermark', () => {
     const dir = tempDir()
     const store = new DiskPageStore(dir)
-    const requested = 'page_requested' as PageId
-    writeFileSync(join(dir, 'pages', `${requested}.page`), encodePage('page_other' as PageId, new TextEncoder().encode('payload')))
-    expect(() => store.readPage(requested)).toThrow(/page id mismatch/)
-  })
-
-  it('rejects a page file with a corrupt checksum', () => {
-    const dir = tempDir()
-    const store = new DiskPageStore(dir)
-    const pageId = store.writePage(new TextEncoder().encode('data'))
-    const path = join(dir, 'pages', `${pageId}.page`)
+    store.writePage(new TextEncoder().encode('data'))
+    store.flush()
+    // Corrupt one byte of the flushed segment: the rebuild must fail loud
+    // instead of silently dropping the page.
+    const path = join(dir, 'pages.bin')
     const bytes = readFileSync(path)
     bytes[bytes.length - 1] = bytes[bytes.length - 1]! ^ 0xff
     writeFileSync(path, bytes)
-    expect(() => store.readPage(pageId)).toThrow(/checksum mismatch/)
+    expect(() => new DiskPageStore(dir)).toThrow(/corrupt page container/)
   })
 
   it('returns an independent copy so callers cannot corrupt stored pages', () => {
@@ -143,20 +148,13 @@ describe('DiskPageStore', () => {
     expect(new TextDecoder().decode(store.readPage(pageId))).toBe('data')
   })
 
-  it('leaves no temp file behind after a write', () => {
+  it('leaves no temp file behind after a write and flush', () => {
     const dir = tempDir()
     const store = new DiskPageStore(dir)
     store.writePage(new TextEncoder().encode('data'))
-    const names = readdirSync(join(dir, 'pages'))
+    store.flush()
+    const names = readdirSync(dir)
     expect(names.some(name => name.endsWith('.tmp'))).toBe(false)
-  })
-
-  it('rejects a page directory containing a non-page file', () => {
-    const dir = tempDir()
-    const store = new DiskPageStore(dir)
-    store.writePage(new TextEncoder().encode('a'))
-    writeFileSync(join(dir, 'pages', 'notes.txt'), 'not a page')
-    expect(() => new DiskPageStore(dir)).toThrow(/unexpected file in page directory/)
   })
 
   it('rejects a corrupt watermark file', () => {
@@ -186,9 +184,10 @@ describe('DiskPageStore', () => {
     const store = new DiskPageStore(dir)
     const first = store.writePage(new TextEncoder().encode('a'))
     const second = store.writePage(new TextEncoder().encode('b'))
+    store.flush()
     store.deletePage(first)
-    // Fresh store without scanning the deleted file: the watermark alone must
-    // keep page_2 retired.
+    store.retain(new Set([second]))
+    // The persisted next-id watermark alone must keep page_2 retired.
     const rebuilt = new DiskPageStore(dir)
     expect(rebuilt.pageIds()).toEqual([second])
     const third = rebuilt.writePage(new TextEncoder().encode('c'))
@@ -270,3 +269,59 @@ function makeSessionFile(eventCount: number): SessionFile {
   }
   return { session, entries: tree.entries(), blobs, references: [], compacted: [] }
 }
+
+describe('segment file layout', () => {
+  it('recovers pages written but not flushed when rebuilding in-process', () => {
+    const dir = tempDir()
+    const store = new DiskPageStore(dir)
+    const a = store.writePage(new TextEncoder().encode('a'))
+    const b = store.writePage(new TextEncoder().encode('b'))
+    // Unflushed pages are already in the segment (kernel cache), so an
+    // in-process rebuild over the same directory recovers them.
+    const rebuilt = new DiskPageStore(dir)
+    expect(new TextDecoder().decode(rebuilt.readPage(a))).toBe('a')
+    expect(new TextDecoder().decode(rebuilt.readPage(b))).toBe('b')
+  })
+
+  it('covers every page written since the last flush in one flush', () => {
+    const dir = tempDir()
+    const store = new DiskPageStore(dir)
+    const a = store.writePage(new TextEncoder().encode('a'))
+    const b = store.writePage(new TextEncoder().encode('b'))
+    store.flush()
+    const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as { watermark: number }
+    const size = readFileSync(join(dir, 'pages.bin')).length
+    expect(size).toBe(meta.watermark)
+    const rebuilt = new DiskPageStore(dir)
+    expect(rebuilt.pageIds()).toEqual([a, b])
+  })
+
+  it('truncates undecodable residue past the watermark', () => {
+    const dir = tempDir()
+    const store = new DiskPageStore(dir)
+    store.writePage(new TextEncoder().encode('a'))
+    store.flush()
+    // Residue: a length header claiming 100 bytes with only 3 following.
+    writeFileSync(join(dir, 'pages.bin'), Buffer.from([0, 0, 0, 100, 1, 2, 3]), { flag: 'a' })
+    const rebuilt = new DiskPageStore(dir)
+    expect(rebuilt.pageIds()).toEqual(['page_0' as PageId])
+    const size = readFileSync(join(dir, 'pages.bin')).length
+    const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as { watermark: number }
+    expect(size).toBe(meta.watermark)
+  })
+
+  it('compacts the segment to the retained pages', () => {
+    const dir = tempDir()
+    const store = new DiskPageStore(dir)
+    const a = store.writePage(new TextEncoder().encode('a'))
+    const b = store.writePage(new TextEncoder().encode('b'))
+    const c = store.writePage(new TextEncoder().encode('c'))
+    store.flush()
+    const before = readFileSync(join(dir, 'pages.bin')).length
+    expect(store.retain(new Set([a, c]))).toBe(1)
+    const after = readFileSync(join(dir, 'pages.bin')).length
+    expect(after).toBeLessThan(before)
+    expect(store.pageIds()).toEqual([a, c])
+    expect(() => store.readPage(b)).toThrow(/missing page/)
+  })
+})

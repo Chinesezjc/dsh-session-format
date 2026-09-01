@@ -96,6 +96,31 @@ export class PageStore {
     this.pages.delete(pageId)
   }
 
+  /** No-op flush: the in-memory store persists nothing, kept for interface
+   * parity with the durable store's two-phase write.
+   */
+  flush(): void {
+    // The in-memory store has no disk phase to synchronize.
+  }
+
+  /** Drop every page not listed, and return how many were removed.
+   * The garbage-collection sweep converges on this single entry point so the
+   * in-memory and durable stores share one retention contract.
+   * @param pageIds - page ids to retain.
+   * @returns the number of pages removed.
+   */
+  retain(pageIds: Iterable<PageId>): number {
+    const keep = new Set(pageIds)
+    let removed = 0
+    for (const pageId of [...this.pages.keys()]) {
+      if (!keep.has(pageId)) {
+        this.pages.delete(pageId)
+        removed += 1
+      }
+    }
+    return removed
+  }
+
   /** All page ids currently stored.
    * @returns the stored page ids in insertion order.
    */

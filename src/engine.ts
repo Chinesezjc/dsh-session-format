@@ -365,6 +365,8 @@ export class SessionFormatEngine {
         usedEventBindings.set(entry.eventId, entry.blobId)
       }
       const record = this.buildRecord(file, usedEventBindings)
+      // Pages become crash-durable before the record that references them.
+      this.pages.flush()
       this.store.putSession(record)
       return record
     }
@@ -522,6 +524,8 @@ export class SessionFormatEngine {
       usedEventBindings.set(entry.eventId, entry.blobId)
     }
     const record = this.buildRecord(file, usedEventBindings)
+    // Pages become crash-durable before the record that references them.
+    this.pages.flush()
     if (!this.store.commit(file.session.sessionId, record, expectedRevision)) return undefined
     // The commit appends the previous generation to backups; return the
     // stored record so the caller sees the published state.
@@ -655,6 +659,9 @@ export class SessionFormatEngine {
       nextEventCounter,
       blobIdWatermark,
     }
+    // The tree-path and blob-chain pages become crash-durable in one flush
+    // before the record that references them.
+    this.pages.flush()
     if (!this.store.commit(sessionId, nextRecord, expectedRevision, new Map([[eventId, blobId]]))) {
       return undefined
     }

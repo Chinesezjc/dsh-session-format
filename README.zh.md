@@ -45,7 +45,7 @@ kind: "package-library"
 - `src/btree.ts` — 内存 Copy-on-Write B+Tree 与 `SessionTree` 门面。
 - `src/file.ts` — 带 durable 边界校验的自包含 session 文件序列化，通过原子文件存储持久化。
 - `src/file-store.ts` — 原子持久文件写入与 checksum 快照容器。
-- `src/disk-page-store.ts` — 持久化页存储：目录下每页一个 checksum 页文件，带持久化 next-id 水位，可从目录重建恢复。
+- `src/disk-page-store.ts` — 持久化页存储：全部页存放于单一追加式段文件，以 (segment, offset, length) 寻址，带持久化 next-id 与字节水位，两阶段写（追加，flush 时 fsync 段并推进水位），retain 时做段压缩。
 - `src/disk-session-store.ts` — 持久化 session 存储：每 session 一个 JSON 记录文件，与 revision CAS 及 used-revision ABA 集合同步原子写入，通过扫描目录重建恢复。
 - `src/compaction.ts` — 物理压缩事务：显式 surface 事件移除、引用重定向与被遮蔽 blob 回收。
 - `src/projection.ts` — EventId watermark 投影状态、折叠与一次性 shadowed 区间重建判定（投影须为压缩前状态）。
@@ -85,9 +85,9 @@ kind: "package-library"
 <a id="known-limitations-and-deferred-work"></a>
 ## 已知限制与延期工作
 
-- **仅内存原型** —— 内存 B+Tree 尚未由单一 durable 多页文件格式支撑；`DiskPageStore` 改为目录下每页一个文件持久化。
+- **仅内存原型** —— 内存 B+Tree 尚未由单一 durable 多页文件格式支撑；`DiskPageStore` 改为把全部页持久化进单一追加式段文件。
 - **仓库基于内存存储** —— `SessionRepository` 通过 `SessionFormatEngine` 组合内存 `PageStore`/`SessionStore`；接入 durable `file-store.ts` 快照延期。`DiskPageStore` 与 `DiskSessionStore` 与 `PageStore`/`SessionStore` 接口可直接互换，引擎与仓库现在即可跑在磁盘页与磁盘记录之上；durable `file-store.ts` 快照容器与共享 store 后端仍延期。
-- **append 为 O(log n) 且增量提交** —— `append` 从持久化高水位（`nextEventCounter`、`blobIdWatermark`）铸造 EventId/BlobId，仅复制最右树路径（O(depth) 页，经 `appendEntryToTree`），追加一个 blob map 链页（`saveBlobAppends`），原地扩展绑定表，并写入瘦身后的记录（绑定表存于每会话的只增日志），随会话增长的每次追加成本恒定。全量操作——注册、压缩、分支、导出/导入与直接 `engine.commitSession`——仍重写整棵树、blob map 与记录，读取（`loadSession`）组装完整文件与绑定表，因此这些仍为 O(n)。磁盘引擎的每页原子文件写入（每页 fsync）主导 append 常数；共享单文件后端可削减该成本。
+- **append 为 O(log n) 且增量提交** —— `append` 从持久化高水位（`nextEventCounter`、`blobIdWatermark`）铸造 EventId/BlobId，仅复制最右树路径（O(depth) 页，经 `appendEntryToTree`），追加一个 blob map 链页（`saveBlobAppends`），原地扩展绑定表，并写入瘦身后的记录（绑定表存于每会话的只增日志），随会话增长的每次追加成本恒定。全量操作——注册、压缩、分支、导出/导入与直接 `engine.commitSession`——仍重写整棵树、blob map 与记录，读取（`loadSession`）组装完整文件与绑定表，因此这些仍为 O(n)。磁盘引擎的 flush（每次提交一次段 fsync 加一次 meta 原子替换）主导 append 常数；把多次 append 合并进一次 flush 可摊薄该成本。
 - **底层提交点派生递增值** —— 直接调用 `engine.commitSession`/`engine.compact` 必须提供严格推进的 revision 与越过文件自身 blob id 的 watermark（两者均在提交点强制）；仓库路径总是派生递增值，提交拒绝降低的计数器或低于 blob map 的 watermark，而不是信任调用方。
 - **存储契约仅限 JSDoc** —— 页/blob 不可变、create-only 写入与 CAS 铸造 revision 都是接口契约，尚无后端实现，也没有按 revision 固定的读取句柄来防止并发 GC 回收页。
 - **append 信任 EventId 计数器** —— `append` 跳过唯一性扫描（系统计数器铸造唯一 id）；`replaceRange` 与 `remove` 会在当前血统内退役被移除的 id，使替换永远无法复用一个仍被旧根（或滚动备份）解析的 id，而直接 `insert` 调用则在入口校验不变量。
