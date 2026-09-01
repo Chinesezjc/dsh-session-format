@@ -257,6 +257,7 @@ export {
 export { SessionFormatEngine } from './engine.ts'
 export { PageStore } from './page-store.ts'
 export { DiskPageStore } from './disk-page-store.ts'
+export { DiskSessionStore } from './disk-session-store.ts'
 export { SessionRepository } from './repository.ts'
 export type { NewSessionFile } from './repository.ts'
 export { SessionStore } from './store.ts'

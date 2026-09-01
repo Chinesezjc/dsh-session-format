@@ -9,6 +9,7 @@ import type { BlobId, EventId, PageId, SessionId, SessionRevision, StoredSession
 import { loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
 import { encodePage } from '../src/pages.ts'
 import { DiskPageStore } from '../src/disk-page-store.ts'
+import { DiskSessionStore } from '../src/disk-session-store.ts'
 import { SessionStore } from '../src/store.ts'
 
 const tempDirs: string[] = []
@@ -233,6 +234,20 @@ describe('DiskPageStore', () => {
     // over the same directory cannot load the session by id.
     const rebuiltEngine = new SessionFormatEngine(rebuiltPages, new SessionStore())
     expect(() => rebuiltEngine.loadSession(file.session.sessionId)).toThrow(/session sess_disk not found/)
+  })
+
+  it('restarts the full engine stack from disk with both durable stores', () => {
+    // The complete durable restart path: pages and session records both live
+    // on disk, so a fresh engine over the same directory restores the session
+    // by id — the boundary the in-memory store pins above.
+    const dir = tempDir()
+    const engine = new SessionFormatEngine(new DiskPageStore(dir), new DiskSessionStore(dir))
+    const file = makeSessionFile(5)
+    engine.saveSession(file)
+    const restarted = new SessionFormatEngine(new DiskPageStore(dir), new DiskSessionStore(dir))
+    const reloaded = restarted.loadSession(file.session.sessionId)
+    expect(reloaded.entries.map(entry => entry.eventId)).toEqual(file.entries.map(entry => entry.eventId))
+    expect(reloaded.blobs.size).toBe(file.blobs.size)
   })
 })
 

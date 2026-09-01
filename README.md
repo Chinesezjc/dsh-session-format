@@ -46,6 +46,7 @@ The package currently contains:
 - `src/file.ts` — self-contained session file serialization with durable-boundary validation, persisted through the atomic file store.
 - `src/file-store.ts` — atomic durable file writes and the checksummed snapshot container.
 - `src/disk-page-store.ts` — durable page store: one checksummed page file per page under a directory, with a persisted next-id watermark and rebuild-from-directory resume.
+- `src/disk-session-store.ts` — durable session store: one JSON record file per session, written atomically with the revision CAS and the used-revision ABA set, rebuilt by scanning the directory.
 - `src/compaction.ts` — physical compaction transaction: explicit surface-event removal, reference redirect, and shadowed-blob reclamation.
 - `src/projection.ts` — EventId watermark projection state, fold, and the one-shot shadowed-range rebuild check (the projection must be the pre-compaction state).
 - `src/fork.ts` — fork by `EventId` with prefix-inherited blobs, references, and compaction summaries.
@@ -83,7 +84,7 @@ No direct effect; cache behavior is owned by the persistence provider that consu
 ## Known Limitations and Deferred Work
 
 - **In-memory prototype only** — the in-memory B+Tree is not yet backed by a single durable multi-page file format; `DiskPageStore` persists one page file per page instead.
-- **Repository over in-memory stores** — `SessionRepository` composes the in-memory `PageStore`/`SessionStore` through `SessionFormatEngine`; wiring it to the durable `file-store.ts` snapshots is deferred. `DiskPageStore` is drop-in compatible with the `PageStore` surface, so the engine can run over disk-backed pages today; the session record store (revision CAS, backups) remains in-memory.
+- **Repository over in-memory stores** — `SessionRepository` composes the in-memory `PageStore`/`SessionStore` through `SessionFormatEngine`; wiring it to the durable `file-store.ts` snapshots is deferred. `DiskPageStore` and `DiskSessionStore` are drop-in compatible with the `PageStore`/`SessionStore` surfaces, so the engine and repository can run over disk-backed pages and records today; the durable `file-store.ts` snapshot container and the shared store backend remain deferred.
 - **Linear id scans on append** — `append` scans the event list and blob map to advance the event counter and blob watermark, and each commit re-reads the current blob map plus every rolling backup's blob map to verify immutability, so appending to an unbounded session is O(n) per call; a persisted counter or index is deferred.
 - **Low-level commit points trust the caller** — direct `engine.commitSession`/`engine.compact` calls can supply a lowered blob watermark or a ceiling revision; the repository path always derives advancing values, and a future change may enforce both at the commit point.
 - **Storage contract is JSDoc-only** — page/blob immutability, create-only writes, and CAS-minted revisions are interface contracts; no backend implements them yet, and there is no revision-bound read handle that pins pages against concurrent GC.
@@ -91,7 +92,6 @@ No direct effect; cache behavior is owned by the persistence provider that consu
 
 - **No real version step** — `SESSION_FORMAT_VERSION` remains v0 and the migration registry is empty.
 - **Per-session files first** — a shared store backend is a later evolution.
-- **Used-revision memory is in-process** — the store rejects ABA revision reuse only while its in-memory used-set survives; a store rebuilt from persisted records loses that history, so a durable backend must mint revisions itself.
 - **Content blocks validate known discriminants only** — `isContentBlock` enforces required fields for `text`/`reasoning`/`tool-call`; other block types pass on the string type tag alone.
 - **Blob immutability is checked per retained generation** — the CAS update rejects a blob rewrite only against the current generation and the backups still retained; once the last backup holding a BlobId rotates out, the same id could carry different bytes, so a durable backend must mint non-reusable blob ids or keep its own used-blob fingerprint.
 - **Session metadata fields mirror SessionHeader** — `parentSession` is a `SessionId` and `origin` is `'subagent'` when present; the migrated record carries these from the legacy header.

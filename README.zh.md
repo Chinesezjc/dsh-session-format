@@ -46,6 +46,7 @@ kind: "package-library"
 - `src/file.ts` — 带 durable 边界校验的自包含 session 文件序列化，通过原子文件存储持久化。
 - `src/file-store.ts` — 原子持久文件写入与 checksum 快照容器。
 - `src/disk-page-store.ts` — 持久化页存储：目录下每页一个 checksum 页文件，带持久化 next-id 水位，可从目录重建恢复。
+- `src/disk-session-store.ts` — 持久化 session 存储：每 session 一个 JSON 记录文件，与 revision CAS 及 used-revision ABA 集合同步原子写入，通过扫描目录重建恢复。
 - `src/compaction.ts` — 物理压缩事务：显式 surface 事件移除、引用重定向与被遮蔽 blob 回收。
 - `src/projection.ts` — EventId watermark 投影状态、折叠与一次性 shadowed 区间重建判定（投影须为压缩前状态）。
 - `src/fork.ts` — 按 `EventId` fork，继承前缀的 blobs、references 与压缩摘要。
@@ -85,7 +86,7 @@ kind: "package-library"
 ## 已知限制与延期工作
 
 - **仅内存原型** —— 内存 B+Tree 尚未由单一 durable 多页文件格式支撑；`DiskPageStore` 改为目录下每页一个文件持久化。
-- **仓库基于内存存储** —— `SessionRepository` 通过 `SessionFormatEngine` 组合内存 `PageStore`/`SessionStore`；接入 durable `file-store.ts` 快照延期。`DiskPageStore` 与 `PageStore` 接口可直接互换，引擎现在即可跑在磁盘页之上；session 记录存储（revision CAS、备份）仍为内存。
+- **仓库基于内存存储** —— `SessionRepository` 通过 `SessionFormatEngine` 组合内存 `PageStore`/`SessionStore`；接入 durable `file-store.ts` 快照延期。`DiskPageStore` 与 `DiskSessionStore` 与 `PageStore`/`SessionStore` 接口可直接互换，引擎与仓库现在即可跑在磁盘页与磁盘记录之上；durable `file-store.ts` 快照容器与共享 store 后端仍延期。
 - **append 线性扫描 id** —— `append` 扫描事件列表与 blob map 以推进事件计数器与 blob watermark，且每次提交都会重读当前 blob map 与全部滚动备份的 blob map 以校验不可变性，无界 session 的每次追加为 O(n)；持久化计数器或索引延期。
 - **底层提交点信任调用方** —— 直接调用 `engine.commitSession`/`engine.compact` 可传入降低的 blob watermark 或上限 revision；仓库路径总是派生递增值，未来变更可能在提交点统一强制。
 - **存储契约仅限 JSDoc** —— 页/blob 不可变、create-only 写入与 CAS 铸造 revision 都是接口契约，尚无后端实现，也没有按 revision 固定的读取句柄来防止并发 GC 回收页。
@@ -93,7 +94,6 @@ kind: "package-library"
 
 - **无真实版本 step** —— `SESSION_FORMAT_VERSION` 仍为 v0，迁移注册表为空。
 - **先做单 session 文件** —— 共享 store 后端是后续演进。
-- **已用 revision 集合仅存于进程内存** —— store 仅在进程内 used-set 存活时拒绝 ABA revision 复用；从持久化记录重建的 store 会丢失该历史，durable 后端须自行铸造 revision。
 - **内容块只校验已知判别** —— `isContentBlock` 对 text/reasoning/tool-call 校验必需字段，其余块类型仅要求字符串 type 标签。
 - **blob 不可变校验仅覆盖保留代** —— CAS 更新只在当前代与仍保留的备份之间拒绝 blob 重写；持有某 BlobId 的最后一个备份轮换出局后，同一 id 可携带不同字节，durable 后端须铸造不可复用 blob id 或独立保留已用 blob 指纹。
 - **会话元数据字段对齐 SessionHeader** —— parentSession 为 SessionId、origin 为 'subagent'（若存在）；迁移记录从旧头携带这些字段。
