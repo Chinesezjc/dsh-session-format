@@ -186,7 +186,14 @@ function fromInternal(store: PageStore, node: Record<string, unknown>, pageId: P
       throw new Error('internal page keys must match the first order of each child')
     }
   }
-  return { kind: 'internal', keys: [...node.keys], children }
+  const lastChild = children[children.length - 1]
+  return {
+    kind: 'internal',
+    size: children.reduce((sum, child) => sum + child.size, 0),
+    maxOrder: lastChild === undefined ? -Infinity : lastChild.maxOrder,
+    keys: [...node.keys],
+    children,
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

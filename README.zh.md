@@ -42,7 +42,7 @@ kind: "package-library"
 本包当前包含：
 
 - `src/index.ts` — 持久化词汇类型、`SessionStorage` 接缝与 session 记录结构。
-- `src/btree.ts` — 内存 Copy-on-Write B+Tree 与 `SessionTree` 门面。
+- `src/btree.ts` — 内存 Copy-on-Write B+Tree 与 `SessionTree` 门面：节点携带子树大小与最大 order，`at`/`rank`/`split` 以 O(log n) 导航而非展平，order→id 映射使查找 O(1)。
 - `src/file.ts` — 带 durable 边界校验的自包含 session 文件序列化，通过原子文件存储持久化。
 - `src/file-store.ts` — 原子持久文件写入与 checksum 快照容器。
 - `src/disk-page-store.ts` — 持久化页存储：全部页存放于单一追加式段文件，以 (segment, offset, length) 寻址，带持久化 next-id 与字节水位，两阶段写（追加，flush 时 fsync 段并推进水位），retain 时做段压缩。

@@ -553,7 +553,7 @@ export class SessionFormatEngine {
   loadSession(sessionId: SessionId): SessionFile {
     const record = this.store.getSession(sessionId)
     if (record === undefined) throw new Error(`session ${sessionId} not found`)
-    const tree = SessionTree.fromEntries(toArray(loadMultiPageTree(this.pages, record.rootPage)))
+    const loadedEntries = toArray(loadMultiPageTree(this.pages, record.rootPage))
     const blobs = record.blobMapPage === undefined
       ? new Map()
       : loadBlobChain(this.pages, record.blobMapPage)
@@ -565,7 +565,7 @@ export class SessionFormatEngine {
       : loadCompactionSummaries(this.pages, record.compactedPage)
     const file: SessionFile = {
       session: record,
-      entries: tree.entries(),
+      entries: loadedEntries,
       blobs,
       references,
       compacted,

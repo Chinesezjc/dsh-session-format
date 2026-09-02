@@ -663,8 +663,10 @@ export function performCompaction(file: SessionFile, input: CompactionInput): Se
       throw new Error(`shadowed range must cover the live surface event ${candidate.eventId}`)
     }
   }
-  const tree = SessionTree.fromEntries(file.entries)
-  const survivors = tree.remove(shadowedIds).entries()
+  // Survivors are the entries not named by the shadowed set, filtered
+  // directly (an array filter) instead of routing through a tree remove that
+  // would flatten and rebuild the tree for the same result.
+  const survivors = file.entries.filter(entry => !shadowed.has(entry.eventId))
   const replacementEntries: LeafEntry[] = [
     { order: 0, eventId: input.startEventId, blobId: input.startBlobId },
     { order: 0, eventId: input.summaryEventId, blobId: input.summaryBlobId },

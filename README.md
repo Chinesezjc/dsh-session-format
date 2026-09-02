@@ -42,7 +42,7 @@ The design is recorded in the proposed Agent Note [`session-physical-compaction-
 The package currently contains:
 
 - `src/index.ts` — durable vocabulary types, the `SessionStorage` seam, and the session record shapes.
-- `src/btree.ts` — in-memory Copy-on-Write B+Tree and the `SessionTree` facade.
+- `src/btree.ts` — in-memory Copy-on-Write B+Tree and the `SessionTree` facade: nodes carry subtree size and max order, so `at`/`rank`/`split` navigate in O(log n) instead of flattening, and the order-by-id map keeps lookups O(1).
 - `src/file.ts` — self-contained session file serialization with durable-boundary validation, persisted through the atomic file store.
 - `src/file-store.ts` — atomic durable file writes and the checksummed snapshot container.
 - `src/disk-page-store.ts` — durable page store: all pages in one append-only segment file, addressed by (segment, offset, length), with persisted next-id and byte watermarks, a two-phase write (append, then flush fsyncs the segment and advances the watermark), and segment compaction on retain.

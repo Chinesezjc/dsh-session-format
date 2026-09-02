@@ -9,6 +9,7 @@ import {
   removeEntries,
   replaceRange,
   split,
+  splitAtRank,
   toArray,
   type InternalNode,
   type LeafEntry,
@@ -417,7 +418,9 @@ describe('B+Tree primitives', () => {
     expect(tree.rank(eventId(4))).toBeUndefined()
     expect(tree.rank(eventId(1))).toBe(1)
     expect(tree.rank(eventId(5))).toBe(3)
-    expect(orders(tree)).toEqual([0, 1, 2, 3, 4])
+    // Survivors keep their orders (gaps allowed): the dense rank is separate
+    // from the sparse order, and compaction renumbers when it rebuilds.
+    expect(orders(tree)).toEqual([0, 1, 3, 5, 6])
 
     const root = fromEntries(Array.from({ length: 5 }, (_, i) => entry(i, i)))
     const remaining = removeEntries(root, [eventId(0), eventId(4)])
@@ -425,5 +428,56 @@ describe('B+Tree primitives', () => {
     expect(() => tree.remove([eventId(999)])).toThrow(/unknown EventId/)
     expect(() => removeEntries(root, [eventId(1), eventId(999)])).toThrow(/unknown EventId/)
     expect(removeEntries(root, [eventId(0), eventId(1), eventId(2), eventId(3), eventId(4)])).toBeUndefined()
+  })
+})
+
+describe('logarithmic navigation', () => {
+  it('splits a deep tree at a rank without flattening or one-child nodes', () => {
+    let tree = SessionTree.empty()
+    for (let i = 0; i < 30; i++) tree = tree.append(eventId(i), blobId(i))
+    const root = fromEntries(tree.entries())
+    for (const rank of [1, 15, 29]) {
+      const [left, right] = splitAtRank(root, rank)
+      const leftEntries = toArray(left)
+      expect(leftEntries).toHaveLength(rank)
+      expect(toArray(right)).toHaveLength(30 - rank)
+      expect(leftEntries.map(e => e.eventId)).toEqual(Array.from({ length: rank }, (_, i) => eventId(i)))
+      const check = (n: TreeNode | undefined): void => {
+        if (n === undefined) return
+        if (n.kind === 'internal') {
+          expect(n.children.length).toBeGreaterThanOrEqual(2)
+          expect(n.size).toBe(n.children.reduce((a, c) => a + c.size, 0))
+          expect(n.maxOrder).toBe(n.children[n.children.length - 1]!.maxOrder)
+          for (const child of n.children) check(child)
+        }
+      }
+      check(left)
+      check(right)
+    }
+  })
+
+  it('keeps ranks dense across sparse orders after removal', () => {
+    let tree = SessionTree.empty()
+    for (let i = 0; i < 30; i++) tree = tree.append(eventId(i), blobId(i))
+    tree = tree.remove([eventId(3), eventId(20)])
+    expect(tree.rank(eventId(3))).toBeUndefined()
+    expect(tree.rank(eventId(4))).toBe(3)
+    expect(tree.rank(eventId(29))).toBe(27)
+    const [left, right] = tree.split(eventId(15))
+    // Boundary 15 stays in the left tree; removed 3/20 are gone.
+    expect(left.size + right.size).toBe(28)
+    expect(left.rank(eventId(15))).toBe(14)
+    expect(left.rank(eventId(3))).toBeUndefined()
+    expect(right.rank(eventId(16))).toBe(0)
+  })
+
+  it('locates entries across leaf boundaries by rank', () => {
+    let tree = SessionTree.empty()
+    for (let i = 0; i < 12; i++) tree = tree.append(eventId(i), blobId(i))
+    expect(tree.rank(eventId(0))).toBe(0)
+    expect(tree.rank(eventId(7))).toBe(7)
+    expect(tree.rank(eventId(11))).toBe(11)
+    expect(tree.at(0)?.eventId).toBe(eventId(0))
+    expect(tree.at(11)?.eventId).toBe(eventId(11))
   })
 })

@@ -17,6 +17,10 @@ export interface LeafEntry {
 /** One internal B+Tree node: routing keys plus child nodes. */
 export interface InternalNode {
   readonly kind: 'internal'
+  /** Number of leaf entries in the subtree; makes rank/at navigation O(depth). */
+  readonly size: number
+  /** Largest order in the subtree; makes range tests in split/count O(1). */
+  readonly maxOrder: number
   readonly keys: readonly number[]
   readonly children: readonly TreeNode[]
 }
@@ -24,6 +28,10 @@ export interface InternalNode {
 /** One B+Tree leaf node: a contiguous run of ordered entries. */
 export interface LeafNode {
   readonly kind: 'leaf'
+  /** Number of entries in the leaf. */
+  readonly size: number
+  /** Largest order in the leaf, or -Infinity for an empty leaf. */
+  readonly maxOrder: number
   readonly entries: readonly LeafEntry[]
 }
 
@@ -54,11 +62,25 @@ function makeLeaf(entries: readonly LeafEntry[]): LeafNode {
   // Copy and freeze the node, its array, and the entries, so a caller holding
   // a node returned by the public ./btree API cannot mutate an old tree in
   // place (e.g. entries.reverse(), entries = [...] or a changed routing key).
-  return Object.freeze({ kind: 'leaf', entries: Object.freeze(entries.map(frozenEntry)) })
+  const last = entries[entries.length - 1]
+  return Object.freeze({
+    kind: 'leaf',
+    size: entries.length,
+    maxOrder: last === undefined ? -Infinity : last.order,
+    entries: Object.freeze(entries.map(frozenEntry)),
+  })
 }
 
 function makeInternal(keys: readonly number[], children: readonly TreeNode[]): InternalNode {
-  return Object.freeze({ kind: 'internal', keys: Object.freeze([...keys]), children: Object.freeze([...children]) })
+  const lastChild = children[children.length - 1]
+  return Object.freeze({
+    kind: 'internal',
+    size: children.reduce((sum, child) => sum + child.size, 0),
+    // An internal node always holds at least one child.
+    maxOrder: (lastChild === undefined ? -Infinity : lastChild.maxOrder),
+    keys: Object.freeze([...keys]),
+    children: Object.freeze([...children]),
+  })
 }
 
 /** Flatten all leaf entries in tree order.
@@ -154,19 +176,19 @@ export function at(root: TreeNode | undefined, rank: number): LeafEntry | undefi
   if (root === undefined || rank < 0) return undefined
   if (isLeaf(root)) return root.entries[rank]
   for (const child of root.children) {
-    const size = leafCount(child)
-    if (rank < size) return at(child, rank)
-    rank -= size
+    if (rank < child.size) return at(child, rank)
+    rank -= child.size
   }
   return undefined
 }
 
-/** Count leaves under a node.
+/** Number of leaf entries in a subtree.
+ * Each node carries its subtree size, so this is O(1).
  * @param node - tree node.
  * @returns the number of leaf entries in the subtree.
  */
 export function leafCount(node: TreeNode): number {
-  return isLeaf(node) ? node.entries.length : node.children.reduce((sum, child) => sum + leafCount(child), 0)
+  return node.size
 }
 
 /** Validate one insertion against the tree invariants.
@@ -292,9 +314,113 @@ export function removeEntries(root: TreeNode | undefined, eventIds: readonly Eve
   const entries = toArray(root)
   const found = entries.filter(entry => ids.has(entry.eventId))
   if (found.length !== ids.size) throw new Error('removeEntries references an unknown EventId')
-  return fromEntries(entries
-    .filter(entry => !ids.has(entry.eventId))
-    .map((entry, index) => ({ ...entry, order: index })))
+  // Survivors keep their orders: the tree stays ordered with gaps, and the
+  // only caller (compaction) renumbers densely itself, so renumbering here
+  // was wasted work.
+  return fromEntries(entries.filter(entry => !ids.has(entry.eventId)))
+}
+
+/** Locate one entry by its order key, returning the entry and the count of
+ * entries that precede it (its dense rank). Walks the tree using each node's
+ * size and maxOrder, so the walk is O(depth); the count is exact because
+ * orders are unique and the tree is kept sorted.
+ * @param node - tree root or subtree, or undefined for an empty tree.
+ * @param order - order key to locate.
+ * @returns the entry carrying the order (undefined when absent) and the
+ * number of entries with a smaller order.
+ */
+function locateByOrder(
+  node: TreeNode | undefined,
+  order: number,
+): { readonly entry: LeafEntry | undefined; readonly count: number } {
+  if (node === undefined) return { entry: undefined, count: 0 }
+  if (isLeaf(node)) {
+    // The leaf is kept sorted; the first entry with order >= target marks the
+    // count of smaller entries, and an exact match is the located entry.
+    let count = 0
+    for (const entry of node.entries) {
+      if (entry.order < order) {
+        count += 1
+      } else if (entry.order === order) {
+        return { entry, count }
+      } else {
+        break
+      }
+    }
+    return { entry: undefined, count }
+  }
+  let count = 0
+  for (const child of node.children) {
+    if (child.maxOrder < order) {
+      count += child.size
+    } else {
+      // The child's range covers the target (or the target is a gap before
+      // it): descend into the first child whose maxOrder is not below it.
+      const sub = locateByOrder(child, order)
+      return { entry: sub.entry, count: count + sub.count }
+    }
+  }
+  return { entry: undefined, count }
+}
+
+/** Build an internal node (or return a lone child directly) from a list of
+ * equal-height children, deriving the routing keys from child first orders.
+ * A single child is returned unwrapped so a split never creates a one-child
+ * internal node, which the invariant and the page loader reject.
+ * @param children - child nodes in order.
+ * @returns the combined node, or undefined when empty.
+ */
+function combineChildren(children: readonly TreeNode[]): TreeNode | undefined {
+  if (children.length === 0) return undefined
+  if (children.length === 1) return children[0]
+  const keys = children.slice(1).map(child => firstOrder(child))
+  return makeInternal(keys, children)
+}
+
+/** Split a tree at a dense rank: the first `rank` entries stay in the left
+ * tree, the rest in the right. Walks one root-to-leaf path and rewrites the
+ * nodes on it, so the split is O(depth) page-object operations instead of
+ * flattening and rebuilding the whole tree.
+ * @param root - tree root, or undefined for an empty tree.
+ * @param rank - number of entries for the left tree, between 0 and the size.
+ * @returns the left and right tree roots.
+ */
+export function splitAtRank(
+  root: TreeNode | undefined,
+  rank: number,
+): [TreeNode | undefined, TreeNode | undefined] {
+  if (root === undefined) return [undefined, undefined]
+  if (rank <= 0) return [undefined, root]
+  if (rank >= root.size) return [root, undefined]
+  return splitNodeAtRank(root, rank)
+}
+
+function splitNodeAtRank(node: TreeNode, rank: number): [TreeNode | undefined, TreeNode | undefined] {
+  if (isLeaf(node)) {
+    const left = node.entries.slice(0, rank)
+    const right = node.entries.slice(rank)
+    return [
+      left.length === 0 ? undefined : makeLeaf(left),
+      right.length === 0 ? undefined : makeLeaf(right),
+    ]
+  }
+  const leftChildren: TreeNode[] = []
+  const rightChildren: TreeNode[] = []
+  for (let index = 0; index < node.children.length; index += 1) {
+    const child = node.children[index]
+    if (child === undefined) throw new Error('empty internal node')
+    if (rank >= child.size) {
+      leftChildren.push(child)
+      rank -= child.size
+      continue
+    }
+    const [left, right] = splitNodeAtRank(child, rank)
+    if (left !== undefined) leftChildren.push(left)
+    if (right !== undefined) rightChildren.push(right)
+    for (const rest of node.children.slice(index + 1)) rightChildren.push(rest)
+    return [combineChildren(leftChildren), combineChildren(rightChildren)]
+  }
+  return [combineChildren(leftChildren), combineChildren(rightChildren)]
 }
 
 /** Split the tree at an order boundary and return two independent trees.
@@ -333,17 +459,24 @@ export function split(root: TreeNode | undefined, atOrder: number): [TreeNode | 
 export class SessionTree {
   private readonly root: TreeNode | undefined
   private readonly usedEventIds: Set<EventId>
+  /** EventId to order key, shared by reference across snapshots and fork
+   * siblings. It is append-only in the same sense as the used-id lineage:
+   * orders are never rewritten in place (removal leaves gaps, compaction
+   * builds a fresh tree with a fresh map), so an entry's order in this map is
+   * always the order it was inserted with, and lookups stay O(1). */
+  private readonly orderById: Map<EventId, number>
 
-  private constructor(root: TreeNode | undefined, usedEventIds: Set<EventId>) {
+  private constructor(root: TreeNode | undefined, usedEventIds: Set<EventId>, orderById: Map<EventId, number>) {
     this.root = root
     this.usedEventIds = usedEventIds
+    this.orderById = orderById
   }
 
   /** Create an empty session tree.
    * @returns an empty SessionTree.
    */
   static empty(): SessionTree {
-    return new SessionTree(undefined, new Set())
+    return new SessionTree(undefined, new Set(), new Map())
   }
 
   /** Build a tree from a sorted entry array.
@@ -352,8 +485,12 @@ export class SessionTree {
    */
   static fromEntries(entries: readonly LeafEntry[]): SessionTree {
     const used = new Set<EventId>()
-    for (const entry of entries) used.add(entry.eventId)
-    return new SessionTree(fromEntries(entries), used)
+    const orderById = new Map<EventId, number>()
+    for (const entry of entries) {
+      used.add(entry.eventId)
+      orderById.set(entry.eventId, entry.order)
+    }
+    return new SessionTree(fromEntries(entries), used, orderById)
   }
 
   /** Number of events in the tree. */
@@ -377,7 +514,7 @@ export class SessionTree {
     this.usedEventIds.add(eventId)
     // When the current max order is at or beyond the safe-integer ceiling,
     // renumber the tree to dense integers first so `maxOrder() + 1` always
-    // strictly increases.
+    // strictly increases (the map is rebuilt from the renumbered entries).
     const maxOrder = this.maxOrder()
     const nextOrder = maxOrder + 1
     if (nextOrder <= maxOrder) {
@@ -386,9 +523,14 @@ export class SessionTree {
       // the appended order strictly increases.
       const dense = toArray(this.root).map((entry, index) => ({ ...entry, order: index }))
       const renumbered = fromEntries(dense)
-      return new SessionTree(insertUnchecked(renumbered, frozenEntry({ order: dense.length, eventId, blobId })), this.usedEventIds)
+      const freshMap = new Map(this.orderById)
+      for (const entry of dense) freshMap.set(entry.eventId, entry.order)
+      freshMap.set(eventId, dense.length)
+      const next = new SessionTree(insertUnchecked(renumbered, frozenEntry({ order: dense.length, eventId, blobId })), this.usedEventIds, freshMap)
+      return next
     }
-    return new SessionTree(insertUnchecked(this.root, frozenEntry({ order: nextOrder, eventId, blobId })), this.usedEventIds)
+    this.orderById.set(eventId, nextOrder)
+    return new SessionTree(insertUnchecked(this.root, frozenEntry({ order: nextOrder, eventId, blobId })), this.usedEventIds, this.orderById)
   }
 
   /** Return the event at a dense rank, or undefined when out of range.
@@ -404,8 +546,13 @@ export class SessionTree {
    * @returns the dense rank, or undefined.
    */
   rank(eventId: EventId): number | undefined {
-    const index = toArray(this.root).findIndex(entry => entry.eventId === eventId)
-    return index === -1 ? undefined : index
+    const order = this.orderById.get(eventId)
+    if (order === undefined) return undefined
+    const located = locateByOrder(this.root, order)
+    // The map may still carry a removed or rewritten id; the tree walk
+    // confirms the entry is live under the same identity.
+    if (located.entry === undefined || located.entry.eventId !== eventId) return undefined
+    return located.count
   }
 
   /** Physically replace a range selected by EventIds and return a new tree.
@@ -432,8 +579,12 @@ export class SessionTree {
     }
     // Build the replacement tree first: the shared used set is updated only
     // after the operation succeeds, so a failed replace never mutates the
-    // lineage (Publish state only at its commit point).
-    const next = new SessionTree(replaceRange(this.root, startOrder, endOrder, newEntries), this.usedEventIds)
+    // lineage (Publish state only at its commit point). The range replace
+    // renumbers densely, so the order map is rebuilt from the next tree.
+    const nextRoot = replaceRange(this.root, startOrder, endOrder, newEntries)
+    const nextMap = new Map<EventId, number>()
+    for (const entry of toArray(nextRoot)) nextMap.set(entry.eventId, entry.order)
+    const next = new SessionTree(nextRoot, this.usedEventIds, nextMap)
     const removedIds = toArray(this.root)
       .filter(entry => entry.order >= startOrder && entry.order <= endOrder)
       .map(entry => entry.eventId)
@@ -449,7 +600,7 @@ export class SessionTree {
   remove(eventIds: readonly EventId[]): SessionTree {
     // Validate before mutating the shared used set: a failed remove (unknown
     // id) must not mark ids used that were never inserted.
-    const next = new SessionTree(removeEntries(this.root, eventIds), this.usedEventIds)
+    const next = new SessionTree(removeEntries(this.root, eventIds), this.usedEventIds, this.orderById)
     for (const id of eventIds) this.usedEventIds.add(id)
     return next
   }
@@ -461,12 +612,17 @@ export class SessionTree {
    * @returns the left and right SessionTrees.
    */
   split(atEventId: EventId): [SessionTree, SessionTree] {
-    const order = this.findOrder(atEventId)
+    const order = this.orderById.get(atEventId)
     if (order === undefined) throw new Error('cannot split at an unknown EventId')
-    const [left, right] = split(this.root, order)
-    for (const entry of toArray(left)) this.usedEventIds.add(entry.eventId)
-    for (const entry of toArray(right)) this.usedEventIds.add(entry.eventId)
-    return [new SessionTree(left, this.usedEventIds), new SessionTree(right, this.usedEventIds)]
+    const located = locateByOrder(this.root, order)
+    if (located.entry === undefined || located.entry.eventId !== atEventId) {
+      throw new Error('cannot split at an unknown EventId')
+    }
+    // The boundary event stays in the left tree: rank of the boundary + 1.
+    const [left, right] = splitAtRank(this.root, located.count + 1)
+    // Every live id is already in the shared lineage (append and remove
+    // maintain it), so splitting needs no extra O(n) sweep of both sides.
+    return [new SessionTree(left, this.usedEventIds, this.orderById), new SessionTree(right, this.usedEventIds, this.orderById)]
   }
 
   /** Order of one EventId, found by scanning the tree, or undefined when absent.
@@ -474,7 +630,7 @@ export class SessionTree {
    * @returns the order key of the event, or undefined.
    */
   private findOrder(eventId: EventId): number | undefined {
-    return toArray(this.root).find(entry => entry.eventId === eventId)?.order
+    return this.orderById.get(eventId)
   }
 
   /** All entries in tree order.

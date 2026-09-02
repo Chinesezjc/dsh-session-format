@@ -38,18 +38,6 @@ function jsonlBytes(events: number, useZstd: boolean): number {
   return zstdCompressSync(Buffer.from(plain), { params: { [constants.ZSTD_c_checksumFlag]: 1 } }).length
 }
 
-function sessionFormatSetup(events: number): { repository: SessionRepository; pages: PageStore } {
-  const pages = new PageStore()
-  const engine = new SessionFormatEngine(pages, new SessionStore())
-  const repository = new SessionRepository(engine)
-  repository.createSession({ session: { sessionId: SID, formatVersion: 1, nextEventCounter: 0 }, entries: [], blobs: new Map(), references: [], compacted: [] })
-  const payload = eventPayload(0)
-  const start = performance.now()
-  for (let i = 0; i < events; i++) repository.append(SID, payload)
-  const writeMs = performance.now() - start
-  return { repository, pages }
-}
-
 function pageBytes(pages: PageStore): number {
   const backing = (pages as unknown as { pages: Map<string, Uint8Array> }).pages
   let total = 0
@@ -66,10 +54,8 @@ const plain = new TextEncoder().encode([JSON.stringify({ type: 'session', versio
 ).join('\n') + '\n')
 const jsonlWriteMs = performance.now() - startW
 
-const { repository, pages } = sessionFormatSetup(EVENTS)
-console.log(`写 ${EVENTS} 事件: JSONL 明文 ${jsonlWriteMs.toFixed(0)}ms | session-format ${''}（见下）`)
+console.log(`写 ${EVENTS} 事件: JSONL 明文 ${jsonlWriteMs.toFixed(0)}ms | session-format 见下`)
 
-// 重新计时 session-format 写（避免混合）
 const p2 = new PageStore()
 const e2 = new SessionFormatEngine(p2, new SessionStore())
 const r2 = new SessionRepository(e2)
