@@ -582,6 +582,99 @@ export class SessionFormatEngine {
     return file
   }
 
+  /** One event of a batched append commit, with the minted identities and the
+   * advanced high-water marks it carries. */
+  commitAppendMany(
+    sessionId: SessionId,
+    events: ReadonlyArray<{
+      readonly eventId: EventId
+      readonly blobId: BlobId
+      /** The event counter after this event. */
+      readonly nextEventCounter: number
+      /** The blob watermark after this event. */
+      readonly nextBlobIdWatermark: number
+      readonly payload: Uint8Array
+    }>,
+    expectedRevision: SessionRevision,
+  ): StoredSessionRecord | undefined {
+    if (events.length === 0) {
+      return this.store.getRecord(sessionId)
+    }
+    const stored = this.store.getRecord(sessionId)
+    // An unknown session or a stale expected revision is a CAS miss, not an
+    // invariant violation: the caller reloads the record and retries.
+    if (stored === undefined || stored.revision !== expectedRevision) return undefined
+    // The caller mints ids from the persisted high-water marks; the commit
+    // rejects a sequence that does not strictly advance them.
+    let counter = stored.nextEventCounter
+    let watermark = stored.blobIdWatermark ?? -1
+    for (const event of events) {
+      if (!Number.isSafeInteger(event.nextEventCounter) || event.nextEventCounter <= counter) {
+        throw new Error(`committed nextEventCounter ${event.nextEventCounter} must advance the stored counter ${counter}`)
+      }
+      if (!Number.isSafeInteger(event.nextBlobIdWatermark) || event.nextBlobIdWatermark <= watermark) {
+        throw new Error(`committed blob watermark ${event.nextBlobIdWatermark} must advance the stored watermark ${watermark}`)
+      }
+      counter = event.nextEventCounter
+      watermark = event.nextBlobIdWatermark
+    }
+    // All tree-path and blob-chain pages are appended in memory first, then
+    // flushed once and committed once, so a batch costs one flush and one
+    // record replacement instead of one per event.
+    let rootPage = stored.rootPage
+    let blobMapPage = stored.blobMapPage
+    const bindings = new Map<EventId, BlobId>()
+    try {
+      for (const event of events) {
+        rootPage = appendEntryToTree(this.pages, rootPage, event.eventId, event.blobId)
+        blobMapPage = saveBlobAppends(this.pages, blobMapPage, new Map([[event.blobId, event.payload]]))
+        bindings.set(event.eventId, event.blobId)
+      }
+    } catch (error) {
+      // The rightmost order hit the number ceiling; fall back to the
+      // whole-snapshot path, which renumbers the tree densely.
+      if (!(error instanceof Error) || !error.message.includes('full renumber')) throw error
+      const file = this.loadSession(sessionId)
+      const tree = SessionTree.fromEntries(file.entries)
+      const blobs = new Map(file.blobs)
+      for (const event of events) {
+        tree.append(event.eventId, event.blobId)
+        blobs.set(event.blobId, event.payload)
+      }
+      const nextFile: SessionFile = {
+        ...file,
+        session: {
+          ...file.session,
+          revision: nextRevision(file.session.revision),
+          nextEventCounter: counter,
+          blobIdWatermark: watermark,
+        },
+        entries: tree.entries(),
+        blobs,
+      }
+      return this.commitSession(nextFile, expectedRevision, file)
+    }
+    this.pages.flush()
+    const { usedEventBindings: _priorTable, ...storedBase } = stored
+    // The batch is non-empty (checked above), so the loop ran at least once
+    // and minted a blob-map chain page.
+    if (blobMapPage === undefined) throw new Error('batch append produced no blob map page')
+    const nextRecord: StoredSessionRecord = {
+      ...storedBase,
+      rootPage,
+      blobMapPage,
+      revision: nextRevision(stored.revision),
+      nextEventCounter: counter,
+      blobIdWatermark: watermark,
+    }
+    if (!this.store.commit(sessionId, nextRecord, expectedRevision, bindings)) {
+      return undefined
+    }
+    const published = this.store.getRecord(sessionId)
+    if (published === undefined) throw new Error(`session ${sessionId} not found after commit`)
+    return published
+  }
+
   /** Persist one append without reconstructing the whole session file.
    * The append writes one new leaf entry along the rightmost tree path
    * (O(depth) pages), appends the new blob to the blob-map chain (one page),

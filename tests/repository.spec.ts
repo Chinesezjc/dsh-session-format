@@ -924,3 +924,66 @@ describe('SessionRepository', () => {
     // The parent keeps its own blobs untouched.
     expect(decode(repository.loadSession(sessionId()).blobs.get(blobId(0)))).toContain('a')
   })
+
+  it('appends a batch in one commit with one revision advance', () => {
+    const { repository, engine } = harness()
+    repository.createSession(newFile())
+    const payloads = [surfaceAppend('a'), surfaceAppend('b'), surfaceAppend('c')]
+    const record = repository.appendBatch(sessionId(), payloads)
+    expect(record?.revision).toBe('rev-1') // one commit, not three
+    const loaded = repository.loadSession(sessionId())
+    expect(loaded.entries).toHaveLength(3)
+    expect(loaded.entries.map(e => e.eventId)).toEqual([eventId(0), eventId(1), eventId(2)])
+    expect(loaded.entries.map(e => e.blobId)).toEqual([blobId(0), blobId(1), blobId(2)])
+    expect(loaded.session.nextEventCounter).toBe(3)
+    expect(loaded.session.blobIdWatermark).toBe(2)
+    expect(loaded.session.usedEventBindings?.size).toBe(3)
+    // Subsequent single appends continue from the batch high-water marks.
+    repository.append(sessionId(), surfaceAppend('d'))
+    const after = repository.loadSession(sessionId())
+    expect(after.entries[3]?.eventId).toBe(eventId(3))
+    expect(after.entries[3]?.blobId).toBe(blobId(3))
+    expect(after.session.revision).toBe('rev-2')
+  })
+
+  it('returns the current record for an empty batch', () => {
+    const { repository, engine } = harness()
+    repository.createSession(newFile())
+    const record = repository.appendBatch(sessionId(), [])
+    expect(record?.revision).toBe('rev-0')
+    expect(repository.loadSession(sessionId()).entries).toHaveLength(0)
+  })
+
+  it('treats a stale batched append as a CAS miss', () => {
+    const { repository, engine } = harness()
+    repository.createSession(newFile())
+    const record = engine.record(sessionId())!
+    // Manually call the engine with a stale revision.
+    const result = engine.commitAppendMany(
+      sessionId(),
+      [{
+        eventId: 'evt_sess_repo_0' as EventId,
+        blobId: 'blob_0' as BlobId,
+        nextEventCounter: 1,
+        nextBlobIdWatermark: 0,
+        payload: surfaceAppend('x'),
+      }],
+      'rev-99' as SessionRevision,
+    )
+    expect(result).toBeUndefined()
+    expect(repository.loadSession(sessionId()).entries).toHaveLength(0)
+  })
+
+  it('rejects a batched append whose counter does not advance', () => {
+    const { repository, engine } = harness()
+    repository.createSession(newFile())
+    const record = engine.record(sessionId())!
+    expect(() => engine.commitAppendMany(
+      sessionId(),
+      [
+        { eventId: 'evt_sess_repo_0' as EventId, blobId: 'blob_0' as BlobId, nextEventCounter: 1, nextBlobIdWatermark: 0, payload: surfaceAppend('a') },
+        { eventId: 'evt_sess_repo_1' as EventId, blobId: 'blob_1' as BlobId, nextEventCounter: 1, nextBlobIdWatermark: 1, payload: surfaceAppend('b') },
+      ],
+      record.revision,
+    )).toThrow(/must advance the stored counter/)
+  })

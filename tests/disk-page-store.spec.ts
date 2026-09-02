@@ -9,6 +9,7 @@ import type { BlobId, EventId, PageId, SessionId, SessionRevision, StoredSession
 import { loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
 import { encodePage } from '../src/pages.ts'
 import { DiskPageStore } from '../src/disk-page-store.ts'
+import { SessionRepository } from '../src/repository.ts'
 import { DiskSessionStore } from '../src/disk-session-store.ts'
 import { SessionStore } from '../src/store.ts'
 
@@ -323,5 +324,31 @@ describe('segment file layout', () => {
     expect(after).toBeLessThan(before)
     expect(store.pageIds()).toEqual([a, c])
     expect(() => store.readPage(b)).toThrow(/missing page/)
+  })
+})
+
+describe('DiskSessionStore batched append', () => {
+  it('recovers a batched append across a full engine restart', () => {
+    const dir = tempDir()
+    const run = (): { repository: SessionRepository; SID: SessionId } => {
+      const pages = new DiskPageStore(dir)
+      const engine = new SessionFormatEngine(pages, new DiskSessionStore(dir))
+      const repository = new SessionRepository(engine)
+      return { repository, SID: 'sess_batch' as SessionId }
+    }
+    const first = run()
+    first.repository.createSession({ session: { sessionId: first.SID, formatVersion: 1, nextEventCounter: 0 }, entries: [], blobs: new Map(), references: [], compacted: [] })
+    const mk = (t: string): Uint8Array => new TextEncoder().encode(JSON.stringify({ type: 'user/message', time: 1, data: { text: t }, surfaceOp: 'append' }))
+    const record = first.repository.appendBatch(first.SID, [mk('a'), mk('b'), mk('c')])
+    expect(record?.revision).toBe('rev-1')
+    // Restart: a fresh engine over the same directory must restore the batch.
+    const second = run()
+    const loaded = second.repository.loadSession(first.SID)
+    expect(loaded.entries).toHaveLength(3)
+    expect(loaded.session.revision).toBe('rev-1')
+    expect(loaded.session.nextEventCounter).toBe(3)
+    expect(loaded.session.usedEventBindings?.size).toBe(3)
+    second.repository.append(first.SID, mk('d'))
+    expect(second.repository.loadSession(first.SID).entries).toHaveLength(4)
   })
 })

@@ -231,6 +231,49 @@ export class SessionRepository {
   }
 
   /**
+   * Append a batch of events in one commit. The EventIds and BlobIds are
+   * minted from the persisted high-water marks, all tree-path and blob-chain
+   * pages are written in memory, and the batch lands with one flush and one
+   * compare-and-swap record commit — so a batch of N events costs one
+   * fsync-and-record cycle instead of N, at the cost of durability granularity
+   * (a crash loses the whole uncommitted batch, like a batched JSONL fsync).
+   * @param sessionId - the session to append to.
+   * @param payloads - the event payloads, appended in order.
+   * @returns the committed record (without its binding table), or undefined
+   * when a concurrent writer advanced the session first.
+   */
+  appendBatch(sessionId: SessionId, payloads: readonly Uint8Array[]): StoredSessionRecord | undefined {
+    if (payloads.length === 0) {
+      return this.engine.record(sessionId)
+    }
+    const record = this.engine.record(sessionId)
+    if (record === undefined) throw new Error(`session ${sessionId} not found`)
+    let counter = record.nextEventCounter
+    let watermark = record.blobIdWatermark ?? -1
+    const events: Array<{
+      readonly eventId: EventId
+      readonly blobId: BlobId
+      readonly nextEventCounter: number
+      readonly nextBlobIdWatermark: number
+      readonly payload: Uint8Array
+    }> = []
+    for (const payload of payloads) {
+      if (counter >= Number.MAX_SAFE_INTEGER) {
+        throw new Error('event counter cannot advance within the safe integer range')
+      }
+      if (watermark >= Number.MAX_SAFE_INTEGER - 1) {
+        throw new Error('session blob counter cannot advance within the safe integer range')
+      }
+      const eventId = `evt_${sessionId}_${counter}` as EventId
+      const blobId = `blob_${watermark + 1}` as BlobId
+      counter += 1
+      watermark += 1
+      events.push({ eventId, blobId, nextEventCounter: counter, nextBlobIdWatermark: watermark, payload })
+    }
+    return this.engine.commitAppendMany(sessionId, events, record.revision)
+  }
+
+  /**
    * Run a physical compaction transaction with a compare-and-swap commit. The
    * repository owns revision advancement: the committed record always carries
    * the revision following the current one, and the replacement event blobs
