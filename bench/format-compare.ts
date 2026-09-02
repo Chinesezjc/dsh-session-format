@@ -20,7 +20,7 @@ import { DiskPageStore } from '../src/disk-page-store.ts'
 import { SessionFormatEngine } from '../src/engine.ts'
 import { DiskSessionStore } from '../src/disk-session-store.ts'
 import { SessionRepository } from '../src/repository.ts'
-import type { SessionId } from '../src/index.ts'
+import type { BlobId, CompactionId, SessionId } from '../src/index.ts'
 
 const EVENTS = Number(process.argv[2] ?? 500)
 const SID = 'cmp' as SessionId
@@ -113,3 +113,113 @@ console.log(`\nvs JSONL 批 fsync:  写 ${(sf.writeMs / jsonlBatch.writeMs).toFi
 console.log(`vs JSONL 每事件 fsync: 写 ${(sf.writeMs / jsonlPerEvent.writeMs).toFixed(2)}x（持久性粒度对齐）`)
 console.log(`\n说明: 持久性粒度 JSONL 批=每 50 事件一次 fsync（崩溃丢≤49 个），每事件档与 session-format 对齐（每事件即持久）`)
 console.log(`      session-format 读含全量校验（validateSessionFile + serialize/deserialize 往返）；空间未含 JSONL 的 zstd 压缩（主仓库默认）`)
+
+const blobId = (n: number): BlobId => `blob_${n}` as BlobId
+
+/** Build the four replacement event envelopes for a physical compaction over
+ * `seqs` (1-based surface positions), mirroring the repository spec's
+ * compact fixtures so the engine's checkpoint/summary validation passes.
+ */
+function buildReplacementBlobs(seqs: number[]): ReadonlyMap<BlobId, Uint8Array> {
+  const count = seqs.length
+  const envelope = (type: string, data: Record<string, unknown>): Uint8Array => {
+    const { surfaceOp, sourceEventSeqs, ...rest } = data
+    const body: Record<string, unknown> = {
+      type, time: 1,
+      data: { compactionId: 'compact_bench', turn: null, ...rest },
+    }
+    if (surfaceOp !== undefined) body.surfaceOp = surfaceOp
+    if (sourceEventSeqs !== undefined) body.sourceEventSeqs = sourceEventSeqs
+    return new TextEncoder().encode(JSON.stringify(body))
+  }
+  const summary = {
+    summary: [{ type: 'text', text: 'checkpoint' }],
+    shadowedTokenCount: count,
+    provider: 'bench',
+    model: 'bench',
+    shadowedRange: { start: 1, end: count },
+    shadowedSeqs: seqs,
+  }
+  return new Map([
+    [blobId(2000), envelope('user/message', {
+      id: 'm2000', role: 'user', content: [{ type: 'text', text: 'checkpoint' }],
+      source: { kind: 'plugin', plugin: 'compact', compactionId: 'compact_bench' },
+      shadowedRange: { start: 1, end: count }, shadowedSeqs: seqs, shadowedTokenCount: count,
+      surfaceOp: { op: 'replace', start: 1, end: count }, sourceEventSeqs: seqs,
+    })],
+    [blobId(2001), envelope('compaction/start', { marker: 2001 })],
+    [blobId(2002), envelope('compaction/summary', summary)],
+    [blobId(2003), envelope('compaction/end', { marker: 2003 })],
+  ])
+}
+
+/** The session-format advantage: physical compaction removes the shadowed
+ * events from disk and from replay, while the JSONL log can only append a
+ * summary and keep every old event. */
+function benchCompaction(events: number, shadow: number): void {
+  const dir = mkdtempSync(join(tmpdir(), 'sf-cmp-compact-'))
+  try {
+    const pages = new DiskPageStore(dir)
+    const engine = new SessionFormatEngine(pages, new DiskSessionStore(dir))
+    const repository = new SessionRepository(engine)
+    repository.createSession({ session: { sessionId: SID, formatVersion: 1, nextEventCounter: 0 }, entries: [], blobs: new Map(), references: [], compacted: [] })
+    const payload = eventPayload(0)
+    for (let i = 0; i < events; i++) repository.append(SID, payload)
+    repository.gc()
+    const sfBytes = (): number => statSync(join(dir, 'pages.bin')).size
+      + statSync(join(dir, 'records', `${SID}.json`)).size
+      + statSync(join(dir, 'bindings', `${SID}.log`)).size
+    const spaceBefore = sfBytes()
+    const entriesBefore = events
+
+    const seqs = Array.from({ length: shadow }, (_, i) => i + 1)
+    const shadowedIds = Array.from({ length: shadow }, (_, i) => `evt_${SID}_${i}` as never)
+    repository.compact(SID, {
+      shadowedIds,
+      checkpointEventId: `evt_${SID}_2000` as never,
+      checkpointBlobId: 'blob_2000' as BlobId,
+      compactionId: 'compact_bench' as CompactionId,
+      startEventId: `evt_${SID}_2001` as never,
+      summaryEventId: `evt_${SID}_2002` as never,
+      endEventId: `evt_${SID}_2003` as never,
+      startBlobId: 'blob_2001' as BlobId,
+      summaryBlobId: 'blob_2002' as BlobId,
+      endBlobId: 'blob_2003' as BlobId,
+    }, buildReplacementBlobs(seqs))
+    repository.gc()
+    // The rolling backups still pin the pre-compaction blob chain, so the
+    // disk space is reclaimed only after enough commits rotate them out.
+    const spaceAfterCompact = sfBytes()
+    const payload2 = eventPayload(0)
+    for (let i = 0; i < 4; i++) repository.append(SID, payload2)
+    repository.gc()
+    const spaceAfterRotate = sfBytes()
+    const entriesAfter = repository.loadSession(SID).entries.length
+
+    // JSONL side: the production compaction seam appends a summary event and
+    // keeps every old event, so bytes and replay size only grow.
+    const jl = mkdtempSync(join(tmpdir(), 'sf-cmp-jl2-'))
+    const fd = openSync(join(jl, 'session.jsonl'), 'w', 0o600)
+    writeSync(fd, new TextEncoder().encode(JSON.stringify({ type: 'session', version: 0, id: SID, createdAt: 1 }) + '\n'))
+    for (let i = 0; i < events; i++) {
+      writeSync(fd, eventPayload(i))
+      writeSync(fd, new TextEncoder().encode('\n'))
+    }
+    writeSync(fd, new TextEncoder().encode(JSON.stringify({ type: 'compaction/summary', time: 1, data: { summary: [{ type: 'text', text: 'checkpoint' }] }, surfaceOp: 'replace' }) + '\n'))
+    closeSync(fd)
+    const jsonlBytes = statSync(join(jl, 'session.jsonl')).size
+    rmSync(jl, { recursive: true, force: true })
+
+    console.log(`\n=== 物理压缩优势（${events} 事件，遮蔽 ${shadow} 个表面事件）===`)
+    console.log(`JSONL（追加 summary，旧事件全保留）:    磁盘 ${(jsonlBytes / 1024).toFixed(1)}KB | 重放 ${events + 1} 个事件`)
+    console.log(`session-format 压缩前:                  磁盘 ${(spaceBefore / 1024).toFixed(1)}KB | 重放 ${entriesBefore} 个事件`)
+    console.log(`session-format 压缩 + GC 后:            磁盘 ${(spaceAfterCompact / 1024).toFixed(1)}KB（备份仍持旧 blob 链）`)
+    console.log(`session-format 压缩 + 备份轮换 + GC:    磁盘 ${(spaceAfterRotate / 1024).toFixed(1)}KB | 重放 ${entriesAfter} 个事件`)
+    console.log(`  空间 ${(spaceAfterRotate / spaceBefore * 100).toFixed(0)}%（JSONL 为 ${(jsonlBytes / spaceBefore * 100).toFixed(0)}% 且持续增长）`)
+    console.log(`  重放 ${(entriesAfter / entriesBefore * 100).toFixed(0)}%（JSONL 恒为 100% + 摘要）`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+benchCompaction(EVENTS, Math.floor(EVENTS * 0.8))
