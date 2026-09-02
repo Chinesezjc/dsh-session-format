@@ -14,6 +14,7 @@
  * Usage: npx vite-node bench/format-compare.ts [events]
  */
 import { closeSync, fsyncSync, mkdtempSync, openSync, readFileSync, statSync, writeSync, rmSync } from 'node:fs'
+import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DiskPageStore } from '../src/disk-page-store.ts'
@@ -43,27 +44,98 @@ interface Result {
   readonly bytes: number
 }
 
-/** Plaintext JSONL with one fsync per `batch` events; `batch = 1` aligns the
- * durability granularity with the session-format one-commit-per-append path. */
-function benchJsonl(events: number, batch: number, label: string): Result {
+/** Byte length of one Zstandard frame starting at the front of `bytes`.
+ * Parses the RFC 8878 frame header (magic, descriptor, window, content size)
+ * and walks the block sequence to the last block.
+ * @param bytes - buffer starting at a Zstandard frame magic.
+ * @returns the frame length in bytes.
+ */
+function zstdFrameLength(bytes: Uint8Array): number {
+  let pos = 0
+  const u32 = (at: number): number => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(at, true)
+  if (u32(pos) !== 0xfd2fb528) throw new Error(`bad zstd frame magic: got ${u32(pos).toString(16)}, pos=${pos}, first=${[...bytes.subarray(0, 12)].map(b => b.toString(16).padStart(2, '0')).join(' ')}`)
+  pos += 4
+  const fhd = bytes[pos]
+  if (fhd === undefined) throw new Error('truncated zstd frame descriptor')
+  pos += 1
+  const fcsFlag = (fhd >> 6) & 0x3
+  const singleSegment = ((fhd >> 5) & 0x1) === 1
+  const hasChecksum = ((fhd >> 2) & 0x1) === 1
+  if (!singleSegment) pos += 1 // window descriptor
+  let fcsSize = [0, 1, 2, 4, 8][fcsFlag] ?? 0
+  if (singleSegment && fcsSize === 0) fcsSize = 1
+  pos += fcsSize
+  for (;;) {
+    const b0 = bytes[pos]
+    const b1 = bytes[pos + 1]
+    const b2 = bytes[pos + 2]
+    if (b0 === undefined || b1 === undefined || b2 === undefined) throw new Error('truncated zstd block header')
+    const last = b0 & 0x1
+    const blockType = (b0 >> 1) & 0x3
+    const blockSize = (b0 >> 3) | (b1 << 5) | (b2 << 13)
+    pos += 3
+    if (blockType === 1) pos += 1 // RLE block: one byte of raw data
+    else pos += blockSize
+    if (last === 1) return pos + (hasChecksum ? 4 : 0) // trailing XXH64 checksum
+  }
+}
+
+/** JSONL with one fsync per `batch` events; `batch = 1` aligns the
+ * durability granularity with the session-format one-commit-per-append path.
+ * The zstd variant matches the production backend's physical container: one
+ * Zstandard frame per batch with the checksum flag set, concatenated. */
+function benchJsonl(events: number, batch: number, label: string, useZstd: boolean): Result {
+  const frame = (bytes: Uint8Array): Uint8Array => {
+    if (!useZstd) return bytes
+    const compressed = zstdCompressSync(Buffer.from(bytes), {
+      params: { [constants.ZSTD_c_checksumFlag]: 1 },
+    })
+    return new Uint8Array(compressed)
+  }
   const dir = mkdtempSync(join(tmpdir(), 'sf-cmp-jsonl-'))
   const path = join(dir, 'session.jsonl')
   const fd = openSync(path, 'w', 0o600)
   try {
-    writeSync(fd, new TextEncoder().encode(JSON.stringify({ type: 'session', version: 0, id: SID, createdAt: 1 })))
-    writeSync(fd, new TextEncoder().encode('\n'))
+    // The production container compresses the whole artifact (header included)
+    // into Zstandard frames; the plaintext tier keeps the header as a raw line.
+    const headerFrame = frame(new TextEncoder().encode(JSON.stringify({ type: 'session', version: 0, id: SID, createdAt: 1 }) + '\n'))
+    writeSync(fd, headerFrame)
     const start = performance.now()
-    for (let i = 0; i < events; i++) {
-      writeSync(fd, eventPayload(i))
-      writeSync(fd, new TextEncoder().encode('\n'))
-      if (i % batch === batch - 1) fsyncSync(fd)
+    let batchBuf: number[] = []
+    const flushBatch = (): void => {
+      if (batchBuf.length === 0) return
+      writeSync(fd, frame(new TextEncoder().encode(batchBuf.join(''))))
+      batchBuf = []
     }
+    for (let i = 0; i < events; i++) {
+      batchBuf.push(new TextDecoder().decode(eventPayload(i)), '\n')
+      if (batchBuf.length >= batch * 2) {
+        flushBatch()
+        fsyncSync(fd)
+      }
+    }
+    flushBatch()
     fsyncSync(fd)
     const writeMs = performance.now() - start
     const readStart = performance.now()
-    const raw = readFileSync(path, 'utf8')
-    for (const line of raw.split('\n')) {
-      if (line !== '') JSON.parse(line)
+    const raw = readFileSync(path)
+    if (useZstd) {
+      // Concatenated frames (the production container): decode each frame in
+      // turn by walking its frame length.
+      let pos = 0
+      while (pos < raw.length) {
+        const frameLen = zstdFrameLength(raw.subarray(pos))
+        const decoded = zstdDecompressSync(raw.subarray(pos, pos + frameLen))
+        for (const line of decoded.toString('utf8').split('\n')) {
+          if (line !== '') JSON.parse(line)
+        }
+        pos += frameLen
+      }
+    } else {
+      const text = raw.toString('utf8')
+      for (const line of text.split('\n')) {
+        if (line !== '') JSON.parse(line)
+      }
     }
     const readMs = performance.now() - readStart
     return { label, writeMs, readMs, bytes: statSync(path).size }
@@ -98,8 +170,9 @@ function benchSessionFormat(events: number): Result {
   }
 }
 
-const jsonlBatch = benchJsonl(EVENTS, JSONL_BATCH, 'JSONL 批 fsync(50)')
-const jsonlPerEvent = benchJsonl(EVENTS, 1, 'JSONL 每事件 fsync')
+const jsonlBatch = benchJsonl(EVENTS, JSONL_BATCH, 'JSONL 批 fsync(50)', false)
+const jsonlZstd = benchJsonl(EVENTS, JSONL_BATCH, 'JSONL zstd(50)', true)
+const jsonlPerEvent = benchJsonl(EVENTS, 1, 'JSONL 每事件 fsync', false)
 const sf = benchSessionFormat(EVENTS)
 const row = (r: Result): string =>
   `${r.label.padEnd(20)} 写 ${r.writeMs.toFixed(1).padStart(8)}ms (${(r.writeMs / EVENTS).toFixed(3)}ms/事件)  ` +
@@ -107,12 +180,14 @@ const row = (r: Result): string =>
 
 console.log(`对比 ${EVENTS} 个事件（payload 同源，单机磁盘引擎）\n`)
 console.log(row(jsonlBatch))
+console.log(row(jsonlZstd))
 console.log(row(jsonlPerEvent))
 console.log(row(sf))
 console.log(`\nvs JSONL 批 fsync:  写 ${(sf.writeMs / jsonlBatch.writeMs).toFixed(1)}x | 读 ${(sf.readMs / jsonlBatch.readMs).toFixed(1)}x | 空间 ${(sf.bytes / jsonlBatch.bytes).toFixed(2)}x`)
 console.log(`vs JSONL 每事件 fsync: 写 ${(sf.writeMs / jsonlPerEvent.writeMs).toFixed(2)}x（持久性粒度对齐）`)
 console.log(`\n说明: 持久性粒度 JSONL 批=每 50 事件一次 fsync（崩溃丢≤49 个），每事件档与 session-format 对齐（每事件即持久）`)
-console.log(`      session-format 读含全量校验（validateSessionFile + serialize/deserialize 往返）；空间未含 JSONL 的 zstd 压缩（主仓库默认）`)
+console.log(`      JSONL zstd 档 = 主仓库物理容器（每批一个 Zstandard frame，checksum flag）；session-format 读含全量校验`)
+console.log(`      payload 高度重复（同文本事件），zstd 压缩率因此偏极端；真实会话事件内容各异，压缩率更低`)
 
 const blobId = (n: number): BlobId => `blob_${n}` as BlobId
 
@@ -208,10 +283,15 @@ function benchCompaction(events: number, shadow: number): void {
     writeSync(fd, new TextEncoder().encode(JSON.stringify({ type: 'compaction/summary', time: 1, data: { summary: [{ type: 'text', text: 'checkpoint' }] }, surfaceOp: 'replace' }) + '\n'))
     closeSync(fd)
     const jsonlBytes = statSync(join(jl, 'session.jsonl')).size
+    // The production backend compresses the whole artifact in one frame.
+    const zstdBytes = zstdCompressSync(readFileSync(join(jl, 'session.jsonl')), {
+      params: { [constants.ZSTD_c_checksumFlag]: 1 },
+    }).length
     rmSync(jl, { recursive: true, force: true })
 
     console.log(`\n=== 物理压缩优势（${events} 事件，遮蔽 ${shadow} 个表面事件）===`)
-    console.log(`JSONL（追加 summary，旧事件全保留）:    磁盘 ${(jsonlBytes / 1024).toFixed(1)}KB | 重放 ${events + 1} 个事件`)
+    console.log(`JSONL 明文（追加 summary，旧事件全保留）:  磁盘 ${(jsonlBytes / 1024).toFixed(1)}KB | 重放 ${events + 1} 个事件`)
+    console.log(`JSONL zstd 整帧（主仓库默认物理格式）:     磁盘 ${(zstdBytes / 1024).toFixed(1)}KB | 重放 ${events + 1} 个事件  ← zstd 压存储，压不了重放`)
     console.log(`session-format 压缩前:                  磁盘 ${(spaceBefore / 1024).toFixed(1)}KB | 重放 ${entriesBefore} 个事件`)
     console.log(`session-format 压缩 + GC 后:            磁盘 ${(spaceAfterCompact / 1024).toFixed(1)}KB（备份仍持旧 blob 链）`)
     console.log(`session-format 压缩 + 备份轮换 + GC:    磁盘 ${(spaceAfterRotate / 1024).toFixed(1)}KB | 重放 ${entriesAfter} 个事件`)
