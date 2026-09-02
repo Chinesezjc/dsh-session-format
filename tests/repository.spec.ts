@@ -905,3 +905,22 @@ describe('SessionRepository', () => {
     expect(result).toBeUndefined()
     expect(repository.loadSession(sessionId()).session.usedEventBindings?.get('evt_sess_repo_0' as EventId)).toBe('blob_0' as BlobId)
   })
+
+  it('appends to a forked child without colliding with inherited blob ids', () => {
+    const { repository } = harness()
+    repository.createSession(newFile())
+    repository.append(sessionId(), surfaceAppend('a'))
+    repository.append(sessionId(), surfaceAppend('b'))
+    repository.append(sessionId(), surfaceAppend('c'))
+    const child = repository.fork(sessionId(), eventId(1), 'sess_forkchild' as SessionId)
+    // The child inherits blobs blob_0..1; the append must mint blob_3 (above
+    // the inherited watermark) instead of colliding with blob_0.
+    repository.append('sess_forkchild' as SessionId, surfaceAppend('child'))
+    const loaded = repository.loadSession('sess_forkchild' as SessionId)
+    expect(loaded.entries).toHaveLength(3)
+    expect(loaded.entries[2]?.eventId).toBe('evt_sess_forkchild_3' as EventId)
+    expect(loaded.entries[2]?.blobId).toBe('blob_3' as BlobId)
+    expect(loaded.session.blobIdWatermark).toBe(3)
+    // The parent keeps its own blobs untouched.
+    expect(decode(repository.loadSession(sessionId()).blobs.get(blobId(0)))).toContain('a')
+  })

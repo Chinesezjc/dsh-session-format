@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
+import { SessionFormatEngine } from '../src/engine.ts'
 import { migrateLegacySession, type LegacyEvent, type LegacySession } from '../src/migrate.ts'
 import { deserializeSessionFile, serializeSessionFile } from '../src/file.ts'
-import type { BlobId, PageId, SessionRevision } from '../src/index.ts'
+import { PageStore } from '../src/page-store.ts'
+import { SessionRepository } from '../src/repository.ts'
+import { SessionStore } from '../src/store.ts'
+import type { BlobId, PageId, SessionId, SessionRevision } from '../src/index.ts'
 
 function record(): { rootPage: PageId; revision: SessionRevision; nextEventCounter: number } {
   return { rootPage: 'page_sess_legacy' as PageId, revision: 'rev-0' as SessionRevision, nextEventCounter: 10 }
@@ -737,3 +741,20 @@ describe('migrateLegacySession', () => {
     )
   })
 })
+
+  it('keeps a migrated session appendable without blob id collision', () => {
+    const { file } = migrateLegacySession(legacySession(), record())
+    const engine = new SessionFormatEngine(new PageStore(), new SessionStore())
+    engine.saveSession(file)
+    const repository = new SessionRepository(engine)
+    const payload = new TextEncoder().encode(JSON.stringify({
+      type: 'user/message', time: 4, data: { text: 'after' }, surfaceOp: 'append',
+    }))
+    repository.append('sess_legacy' as SessionId, payload)
+    const loaded = repository.loadSession('sess_legacy' as SessionId)
+    expect(loaded.entries).toHaveLength(4)
+    // Migration minted blob_0..2; the append must mint blob_3 (above the
+    // migrated watermark) instead of colliding with an inherited blob.
+    expect(loaded.entries[3]?.blobId).toBe('blob_3' as BlobId)
+    expect(loaded.session.blobIdWatermark).toBe(3)
+  })

@@ -164,6 +164,10 @@ export function forkSessionFile(
     sessionId: childSessionId,
     formatVersion: file.session.formatVersion,
     nextEventCounter: record.nextEventCounter,
+    // The inherited blobs are a subset of the parent's, so the parent's blob
+    // watermark stays valid: without it the O(1) append path would mint an id
+    // colliding with an inherited blob.
+    ...(file.session.blobIdWatermark === undefined ? {} : { blobIdWatermark: file.session.blobIdWatermark }),
     ...(file.session.cwd === undefined ? {} : { cwd: file.session.cwd }),
     ...(file.session.origin === undefined ? {} : { origin: file.session.origin }),
     ...(file.session.delegationDepth === undefined ? {} : { delegationDepth: file.session.delegationDepth }),

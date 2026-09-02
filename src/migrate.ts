@@ -394,6 +394,10 @@ export function migrateLegacySession(
     sessionId: legacy.id as SessionId,
     formatVersion: 1,
     nextEventCounter: record.nextEventCounter,
+    // Migration mints blob_<seq> for every event (seq is 0-based), so the
+    // watermark sits at the highest migrated seq; without it the O(1) append
+    // path would mint a colliding id.
+    ...(legacy.events.length === 0 ? {} : { blobIdWatermark: legacy.events.length - 1 }),
     rootPage: record.rootPage,
     revision: record.revision,
     createdAt: legacy.createdAt,
