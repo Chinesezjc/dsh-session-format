@@ -303,3 +303,69 @@ function benchCompaction(events: number, shadow: number): void {
 }
 
 benchCompaction(EVENTS, Math.floor(EVENTS * 0.8))
+
+/** The JSONL format's structural advantages beyond bytes: streaming reads
+ * (bounded memory) and incremental tail reads (cost proportional to the new
+ * events, not the whole log). These are format capabilities the production
+ * implementation does not currently use (readStoredLog reads the whole file),
+ * so they are measured as the format's ceiling, labeled accordingly. */
+function benchStreamingAndIncremental(events: number, extra: number): void {
+  const dir = mkdtempSync(join(tmpdir(), 'sf-cmp-mem-'))
+  try {
+    // --- JSONL: write N events, record the tail offset, append M more ---
+    const path = join(dir, 'session.jsonl')
+    const fd = openSync(path, 'w', 0o600)
+    writeSync(fd, new TextEncoder().encode(JSON.stringify({ type: 'session', version: 0, id: SID, createdAt: 1 }) + '\n'))
+    const offsets: number[] = [0]
+    for (let i = 0; i < events + extra; i++) {
+      const line = new TextDecoder().decode(eventPayload(i)) + '\n'
+      writeSync(fd, new TextEncoder().encode(line))
+      if (i === events - 1) offsets.push(statSync(path).size) // offset after the first N events
+    }
+    fsyncSync(fd)
+    closeSync(fd)
+
+    // Streaming read of all lines: parse and drop, keep only a counter.
+    const rssBefore = process.memoryUsage().rss
+    const full = readFileSync(path, 'utf8')
+    let count = 0
+    for (const line of full.split('\n')) {
+      if (line !== '') { JSON.parse(line); count += 1 }
+    }
+    const rssDeltaStreaming = process.memoryUsage().rss - rssBefore
+
+    // Incremental tail read from the recorded offset: only the M extra events.
+    const t0 = performance.now()
+    const tail = readFileSync(path, 'utf8').slice(offsets[1] ?? 0)
+    let tailCount = 0
+    for (const line of tail.split('\n')) {
+      if (line !== '') { JSON.parse(line); tailCount += 1 }
+    }
+    const tailMs = performance.now() - t0
+    void full
+    void count
+
+    // --- session-format: loadSession materializes the whole file ---
+    const pages = new DiskPageStore(join(dir, 'sf'))
+    const engine = new SessionFormatEngine(pages, new DiskSessionStore(join(dir, 'sf')))
+    const repository = new SessionRepository(engine)
+    repository.createSession({ session: { sessionId: SID, formatVersion: 1, nextEventCounter: 0 }, entries: [], blobs: new Map(), references: [], compacted: [] })
+    for (let i = 0; i < events + extra; i++) repository.append(SID, eventPayload(i))
+    const rssBefore2 = process.memoryUsage().rss
+    const t1 = performance.now()
+    const file = repository.loadSession(SID) // materializes entries + blobs
+    const loadMs = performance.now() - t1
+    const rssDeltaMaterialize = process.memoryUsage().rss - rssBefore2
+    void file
+
+    console.log(`\n=== 流式与增量读取（${events} 事件 + ${extra} 增量，格式能力上限）===`)
+    console.log(`JSONL 流式读（逐行解析丢弃）:       峰值内存 +${(rssDeltaStreaming / 1024 / 1024).toFixed(1)}MB`)
+    console.log(`session-format loadSession（物化全部）: 峰值内存 +${(rssDeltaMaterialize / 1024 / 1024).toFixed(1)}MB | 耗时 ${loadMs.toFixed(1)}ms`)
+    console.log(`JSONL 增量读尾部（seek 到记录偏移）:    ${tailMs.toFixed(2)}ms 读 ${tailCount} 个事件（∝新增量，非全量）`)
+    console.log(`  （主仓库 JSONL 实现当前未使用流式/增量读——readStoredLog 仍全量读取；session-format 无增量读 API，loadSession 是唯一读路径）`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+benchStreamingAndIncremental(EVENTS, 50)
