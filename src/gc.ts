@@ -79,10 +79,17 @@ function referencedPageIds(payload: Uint8Array): PageId[] {
  */
 export function collectGarbage(store: PageStore, sessions: Iterable<StoredSessionRecord>): number {
   const reachable = new Set<PageId>()
-  const visit = (pageId: PageId): void => {
-    if (reachable.has(pageId)) return
-    reachable.add(pageId)
-    for (const child of referencedPageIds(store.readPage(pageId))) visit(child)
+  // Iterative traversal: the blob-map chain is linear in the number of
+  // appends, so a recursive visit would overflow the stack on a session with
+  // tens of thousands of pages.
+  const visit = (root: PageId): void => {
+    const stack: PageId[] = [root]
+    while (stack.length > 0) {
+      const pageId = stack.pop()
+      if (pageId === undefined || reachable.has(pageId)) continue
+      reachable.add(pageId)
+      for (const child of referencedPageIds(store.readPage(pageId))) stack.push(child)
+    }
   }
   const visitRecord = (record: StoredSessionRecord): void => {
     visit(record.rootPage)

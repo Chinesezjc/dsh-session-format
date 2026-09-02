@@ -315,4 +315,33 @@ describe('collectGarbage', () => {
     expect(() => collectGarbage(store, [kindlessSession]))
       .toThrow(/cannot traverse a reachable metadata page carrying children/)
   })
+
+  it('collects a long blob-map chain without overflowing the stack', () => {
+    // The blob-map chain is linear in the number of appends; a recursive
+    // traversal overflows the stack once the chain reaches tens of thousands
+    // of pages, so the sweep must iterate.
+    const store = new PageStore()
+    let head: string | undefined
+    const CHAIN = 40000
+    for (let i = 0; i < CHAIN; i++) {
+      head = store.writePage(new TextEncoder().encode(JSON.stringify({
+        kind: 'blob-appends',
+        ...(head === undefined ? {} : { prev: head }),
+        blobs: {},
+      })))
+    }
+    const leaf = store.writePage(new TextEncoder().encode(JSON.stringify({ kind: 'leaf', entries: [] })))
+    const session: StoredSessionRecord = {
+      sessionId: 'sess_chain' as SessionId,
+      formatVersion: 1,
+      rootPage: leaf,
+      blobMapPage: head as never,
+      revision: 'rev-1' as SessionRevision,
+      nextEventCounter: CHAIN,
+      backups: [],
+    }
+    expect(() => collectGarbage(store, [session])).not.toThrow()
+    // Everything reachable is retained.
+    expect(store.pageIds()).toHaveLength(CHAIN + 1)
+  })
 })
