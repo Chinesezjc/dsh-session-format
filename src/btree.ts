@@ -39,12 +39,13 @@ export interface LeafNode {
 export type TreeNode = InternalNode | LeafNode
 
 
-// Prototype fanout constants. The durable page format proposed in the Agent
-// Note (.agents/notes/proposed/architecture/2026-08-26-session-physical-compaction-btree-pointer.md)
-// fixes 4 KB pages; these small constants keep the in-memory prototype's split
-// paths cheap to exercise without committing a page size.
-const MAX_ENTRIES = 4
-const MAX_KEYS = 4
+// Fanout constants. The durable page format proposed in the Agent Note
+// (.agents/notes/proposed/architecture/2026-08-26-session-physical-compaction-btree-pointer.md)
+// fixes 4 KB pages; 64 entries at roughly 60 bytes of JSON entry each land a
+// full leaf near that size, so these constants stand in for the physical page
+// the durable format commits.
+export const MAX_ENTRIES = 64
+export const MAX_KEYS = 64
 
 function isLeaf(node: TreeNode): node is LeafNode {
   return node.kind === 'leaf'

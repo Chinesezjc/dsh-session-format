@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { fromEntries, SessionTree, toArray } from '../src/btree.ts'
 import { collectGarbage } from '../src/gc.ts'
 import type { BlobId, EventId, SessionId, StoredSessionRecord, SessionRevision } from '../src/index.ts'
-import { loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
+import { MAX_ENTRIES, loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
 import { PageStore } from '../src/page-store.ts'
 
 function eventId(n: number): EventId {
@@ -56,7 +56,7 @@ describe('collectGarbage', () => {
   it('keeps child pages of a multi-page tree root', () => {
     const store = new PageStore()
     let tree = SessionTree.empty()
-    for (let i = 0; i < 20; i++) tree = tree.append(eventId(i), blobId(i))
+    for (let i = 0; i < MAX_ENTRIES + 20; i++) tree = tree.append(eventId(i), blobId(i))
     const root = saveMultiPageTree(store, fromEntries(tree.entries()))
     const orphan = store.writePage(new TextEncoder().encode('orphan'))
     const session: StoredSessionRecord = {

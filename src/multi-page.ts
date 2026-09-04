@@ -8,11 +8,10 @@ import { toArray, fromEntries, type LeafEntry, type TreeNode } from './btree.ts'
 import type { BlobId, EventId, PageId } from './index.ts'
 import type { PageStore } from './page-store.ts'
 
-// Fanout caps mirror btree.ts; the durable page format proposed in the Agent
-// Note fixes 4 KB pages, and these small prototype constants keep the split
-// paths cheap to exercise without committing a page size.
-const MAX_ENTRIES = 4
-const MAX_KEYS = 4
+// Fanout caps mirror btree.ts; 64 entries stand in for the 4 KB physical page
+// the durable format commits (see btree.ts).
+export const MAX_ENTRIES = 64
+export const MAX_KEYS = 64
 
 /** Flattened entries must be strictly increasing and carry unique EventIds.
  * Mirrors btree.ts's cross-leaf invariant check for pages rebuilt by hand.

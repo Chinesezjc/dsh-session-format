@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { fromEntries, SessionTree, toArray } from '../src/btree.ts'
-import { appendEntryToTree, loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
+import { MAX_ENTRIES, MAX_KEYS, appendEntryToTree, loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
 import { encodePage } from '../src/pages.ts'
 import { PageStore } from '../src/page-store.ts'
 import type { BlobId, EventId, PageId } from '../src/index.ts'
@@ -17,7 +17,7 @@ describe('multi-page B+Tree', () => {
   it('saves and loads a tree across multiple pages', () => {
     const store = new PageStore()
     let tree = SessionTree.empty()
-    for (let i = 0; i < 20; i++) tree = tree.append(eventId(i), blobId(i))
+    for (let i = 0; i < MAX_ENTRIES + 20; i++) tree = tree.append(eventId(i), blobId(i))
     const root = saveMultiPageTree(store, fromEntries(tree.entries()))
     expect(store.size).toBeGreaterThan(1)
     const loaded = loadMultiPageTree(store, root)
@@ -37,7 +37,7 @@ describe('multi-page B+Tree', () => {
   it('preserves the internal node structure instead of flattening', () => {
     const store = new PageStore()
     let tree = SessionTree.empty()
-    for (let i = 0; i < 20; i++) tree = tree.append(eventId(i), blobId(i))
+    for (let i = 0; i < MAX_ENTRIES + 20; i++) tree = tree.append(eventId(i), blobId(i))
     const root = saveMultiPageTree(store, fromEntries(tree.entries()))
     // An internal root keeps its children as separate pages; loading through
     // the root yields an internal node whose keys survive the round trip.
@@ -212,7 +212,7 @@ describe('multi-page B+Tree', () => {
     const store = new PageStore()
     const page = store.writePage(new TextEncoder().encode(JSON.stringify({
       kind: 'leaf',
-      entries: Array.from({ length: 5 }, (_, index) => ({ order: index + 1, eventId: `evt_${index + 1}`, blobId: `blob_${index + 1}` })),
+      entries: Array.from({ length: MAX_ENTRIES + 1 }, (_, index) => ({ order: index + 1, eventId: `evt_${index + 1}`, blobId: `blob_${index + 1}` })),
     })))
     expect(() => loadMultiPageTree(store, page)).toThrow(/above the per-node cap/)
   })
@@ -220,7 +220,7 @@ describe('multi-page B+Tree', () => {
   it('rejects an over-fanout internal page and mixed-depth children', () => {
     const store = new PageStore()
     const leaves: PageId[] = []
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < MAX_KEYS + 2; i++) {
       leaves.push(store.writePage(new TextEncoder().encode(JSON.stringify({
         kind: 'leaf',
         entries: [{ order: i + 1, eventId: `evt_${i + 1}`, blobId: `blob_${i + 1}` }],
@@ -298,10 +298,10 @@ describe('appendEntryToTree', () => {
   it('splits a full leaf into two sibling leaves', () => {
     const store = new PageStore()
     let root = saveMultiPageTree(store, undefined)
-    // MAX_ENTRIES = 4: the fifth append splits the leaf; the empty seed leaf
-    // is unreachable from the new root.
-    for (let i = 0; i < 5; i++) root = appendEntryToTree(store, root, eventId(i), blobId(i))
-    expect(toArray(loadMultiPageTree(store, root))).toHaveLength(5)
+    // The append past MAX_ENTRIES splits the leaf; the empty seed leaf is
+    // unreachable from the new root.
+    for (let i = 0; i < MAX_ENTRIES + 1; i++) root = appendEntryToTree(store, root, eventId(i), blobId(i))
+    expect(toArray(loadMultiPageTree(store, root))).toHaveLength(MAX_ENTRIES + 1)
     // The split produced an internal root over two leaves (copy-on-write
     // pages accumulate, so the store holds the seed leaf plus the path
     // copies).
@@ -314,14 +314,17 @@ describe('appendEntryToTree', () => {
     const store = new PageStore()
     let root = saveMultiPageTree(store, undefined)
     let tree = SessionTree.empty()
-    for (let i = 0; i < 25; i++) {
+    // (MAX_ENTRIES + 1) leaves overflow a single-level internal root only past
+    // MAX_KEYS leaves; push through both levels.
+    const total = (MAX_KEYS + 2) * (MAX_ENTRIES + 1)
+    for (let i = 0; i < total; i++) {
       root = appendEntryToTree(store, root, eventId(i), blobId(i))
       tree = tree.append(eventId(i), blobId(i))
     }
     const loaded = toArray(loadMultiPageTree(store, root))
-    expect(loaded).toHaveLength(25)
+    expect(loaded).toHaveLength(total)
     expect(loaded.map(entry => entry.eventId)).toEqual(tree.entries().map(entry => entry.eventId))
-    expect(loaded.map(entry => entry.order)).toEqual(Array.from({ length: 25 }, (_, i) => i))
+    expect(loaded.map(entry => entry.order)).toEqual(Array.from({ length: total }, (_, i) => i))
   })
 
   it('rejects an order that cannot advance past the number ceiling', () => {
