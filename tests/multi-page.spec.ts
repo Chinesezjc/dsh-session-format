@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { fromEntries, SessionTree, toArray } from '../src/btree.ts'
-import { MAX_ENTRIES, MAX_KEYS, appendEntryToTree, loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
+import { MAX_ENTRIES, MAX_KEYS, appendBatchToTree, appendEntryToTree, loadMultiPageTree, saveMultiPageTree } from '../src/multi-page.ts'
 import { encodePage } from '../src/pages.ts'
 import { PageStore } from '../src/page-store.ts'
 import type { BlobId, EventId, PageId } from '../src/index.ts'
@@ -334,5 +334,127 @@ describe('appendEntryToTree', () => {
     const leaf = { kind: 'leaf' as const, entries: [{ order: ceiling, eventId: eventId(0), blobId: blobId(0) }] }
     const root = store.writePage(new TextEncoder().encode(JSON.stringify(leaf)))
     expect(() => appendEntryToTree(store, root, eventId(1), blobId(1))).toThrow(/full renumber/)
+  })
+})
+
+describe('appendBatchToTree', () => {
+  /** Deterministic pseudo-random batch sizes in [1, cap]. */
+  function batches(count: number, seed: number, cap: number): number[] {
+    const sizes: number[] = []
+    let remaining = count
+    let state = seed
+    while (remaining > 0) {
+      state = (state * 1103515245 + 12345) % 2147483648
+      const size = Math.min(remaining, 1 + (state % cap))
+      sizes.push(size)
+      remaining -= size
+    }
+    return sizes
+  }
+
+  function eventId(n: number): EventId { return `evt_batch_${n}` as EventId }
+  function blobId(n: number): BlobId { return `blob_${n}` as BlobId }
+
+  it('builds a multi-leaf tree from an empty root in one call', () => {
+    const store = new PageStore()
+    const empty = saveMultiPageTree(store, undefined)
+    const root = appendBatchToTree(
+      store, empty,
+      Array.from({ length: MAX_ENTRIES * 3 + 7 }, (_, i) => ({ eventId: eventId(i), blobId: blobId(i) })),
+    )
+    const loaded = toArray(loadMultiPageTree(store, root))
+    expect(loaded).toHaveLength(MAX_ENTRIES * 3 + 7)
+    expect(loaded.map(entry => entry.order)).toEqual(Array.from({ length: MAX_ENTRIES * 3 + 7 }, (_, i) => i))
+    const rootNode = loadMultiPageTree(store, root)
+    expect(rootNode?.kind).toBe('internal')
+  })
+
+  it('matches per-event appends for any batch partition of one stream', () => {
+    for (const seed of [1, 7, 42]) {
+      const total = 300 + seed * 37
+      const incremental = new PageStore()
+      let incRoot = saveMultiPageTree(incremental, undefined)
+      for (let i = 0; i < total; i++) incRoot = appendEntryToTree(incremental, incRoot, eventId(i), blobId(i))
+
+      const batched = new PageStore()
+      let batRoot = saveMultiPageTree(batched, undefined)
+      let cursor = 0
+      for (const size of batches(total, seed, 70)) {
+        batRoot = appendBatchToTree(
+          batched, batRoot,
+          Array.from({ length: size }, (_, k) => ({ eventId: eventId(cursor + k), blobId: blobId(cursor + k) })),
+        )
+        cursor += size
+      }
+      expect(cursor).toBe(total)
+
+      const expected = toArray(loadMultiPageTree(incremental, incRoot))
+      const actual = toArray(loadMultiPageTree(batched, batRoot))
+      expect(actual.map(entry => entry.eventId)).toEqual(expected.map(entry => entry.eventId))
+      expect(actual.map(entry => entry.order)).toEqual(expected.map(entry => entry.order))
+    }
+  })
+
+  it('splits the rightmost leaf across the exact boundary inside one batch', () => {
+    const total = MAX_ENTRIES + 2
+    const incremental = new PageStore()
+    let incRoot = saveMultiPageTree(incremental, undefined)
+    for (let i = 0; i < total; i++) incRoot = appendEntryToTree(incremental, incRoot, eventId(i), blobId(i))
+
+    // One batch that lands exactly on the split boundary (leaf full at MAX_ENTRIES).
+    const batched = new PageStore()
+    let batRoot = saveMultiPageTree(batched, undefined)
+    for (let i = 0; i < MAX_ENTRIES - 1; i++) batRoot = appendEntryToTree(batched, batRoot, eventId(i), blobId(i))
+    batRoot = appendBatchToTree(
+      batched, batRoot,
+      Array.from({ length: 3 }, (_, k) => ({ eventId: eventId(MAX_ENTRIES - 1 + k), blobId: blobId(MAX_ENTRIES - 1 + k) })),
+    )
+
+    const expected = toArray(loadMultiPageTree(incremental, incRoot))
+    const actual = toArray(loadMultiPageTree(batched, batRoot))
+    expect(actual.map(entry => entry.eventId)).toEqual(expected.map(entry => entry.eventId))
+    const rootNode = loadMultiPageTree(batched, batRoot)
+    expect(rootNode?.kind).toBe('internal')
+  })
+
+  it('stays equivalent and loadable across many consecutive batches', () => {
+    const incremental = new PageStore()
+    let incRoot = saveMultiPageTree(incremental, undefined)
+    const total = MAX_ENTRIES * MAX_KEYS * 2 + 50
+    const batched = new PageStore()
+    let batRoot = saveMultiPageTree(batched, undefined)
+    let cursor = 0
+    let batchIndex = 0
+    for (const size of batches(total, 99, 64)) {
+      const batch = Array.from({ length: size }, (_, k) => ({ eventId: eventId(cursor + k), blobId: blobId(cursor + k) }))
+      batRoot = appendBatchToTree(batched, batRoot, batch)
+      for (const entry of batch) incRoot = appendEntryToTree(incremental, incRoot, entry.eventId, entry.blobId)
+      cursor += size
+      // Full-tree equivalence on a sample (every 8th batch) and at the end;
+      // per-batch full loads would make this quadratic.
+      if (batchIndex % 8 === 0 || cursor === total) {
+        const expected = toArray(loadMultiPageTree(incremental, incRoot))
+        const actual = toArray(loadMultiPageTree(batched, batRoot))
+        expect(actual.map(entry => entry.eventId)).toEqual(expected.map(entry => entry.eventId))
+      }
+      batchIndex += 1
+    }
+    expect(cursor).toBe(total)
+  })
+
+  it('keeps appending to the newest leaf after a big batch split', () => {
+    const store = new PageStore()
+    let root = saveMultiPageTree(store, undefined)
+    root = appendBatchToTree(
+      store, root,
+      Array.from({ length: MAX_ENTRIES * 2 + 5 }, (_, i) => ({ eventId: eventId(i), blobId: blobId(i) })),
+    )
+    // Subsequent single appends continue the rightmost (newest) leaf.
+    for (let i = MAX_ENTRIES * 2 + 5; i < MAX_ENTRIES * 3 + 5; i++) {
+      root = appendEntryToTree(store, root, eventId(i), blobId(i))
+    }
+    const loaded = toArray(loadMultiPageTree(store, root))
+    expect(loaded).toHaveLength(MAX_ENTRIES * 3 + 5)
+    expect(loaded.map(entry => entry.order)).toEqual(Array.from({ length: MAX_ENTRIES * 3 + 5 }, (_, i) => i))
   })
 })

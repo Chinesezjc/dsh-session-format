@@ -20,7 +20,7 @@ import {
   saveCompactionSummaries,
   saveReferences,
 } from './metadata.ts'
-import { appendEntryToTree, loadMultiPageTree, saveMultiPageTree } from './multi-page.ts'
+import { appendBatchToTree, appendEntryToTree, loadMultiPageTree, saveMultiPageTree } from './multi-page.ts'
 import type { PageStore } from './page-store.ts'
 import { SessionStore } from './store.ts'
 
@@ -625,8 +625,15 @@ export class SessionFormatEngine {
     let blobMapPage = stored.blobMapPage
     const bindings = new Map<EventId, BlobId>()
     try {
+      // One tree traversal serves the whole batch: the batch's events are
+      // spliced into the rightmost leaf together and the path is copied once
+      // (O(depth + batch leaves) pages) instead of once per event.
+      rootPage = appendBatchToTree(
+        this.pages,
+        rootPage,
+        events.map(event => ({ eventId: event.eventId, blobId: event.blobId })),
+      )
       for (const event of events) {
-        rootPage = appendEntryToTree(this.pages, rootPage, event.eventId, event.blobId)
         blobMapPage = saveBlobAppends(this.pages, blobMapPage, new Map([[event.blobId, event.payload]]))
         bindings.set(event.eventId, event.blobId)
       }

@@ -268,66 +268,112 @@ function writeInternalPage(store: PageStore, keys: readonly number[], children: 
   return store.writePage(new TextEncoder().encode(JSON.stringify({ kind: 'internal', keys: [...keys], children: [...children] })))
 }
 
-/** Result of appending into one subtree: the subtree's new root page and,
- * when the root split, the new right sibling page.
- */
-interface AppendResult {
-  readonly rootPage: PageId
-  readonly split?: PageId
+/** One batched append: an event identity pair destined for the rightmost leaf. */
+export interface BatchEntry {
+  readonly eventId: EventId
+  readonly blobId: BlobId
 }
 
-/** Append one entry to the rightmost leaf of a subtree, copying the rightmost
- * path. Each level writes at most two new pages (the copied node and, on a
- * split, its right sibling), so the whole append writes O(depth) pages and
- * reads O(depth) pages. Throws when the entry order cannot advance (the
- * rightmost order is at the number ceiling); callers fall back to a full
- * renumber in that case.
- * @param store - page store holding the tree.
- * @param pageId - subtree root page.
- * @param eventId - identity of the appended event.
- * @param blobId - blob holding the event payload.
- * @returns the new subtree root page and any split sibling.
+/** Result of rewriting one subtree level: the pages replacing the subtree's
+ * rightmost path child, in order. Length 1 is the common case; a split level
+ * yields 2; the rightmost leaf yields as many leaves as its contents need.
  */
-function appendInto(store: PageStore, pageId: PageId, eventId: EventId, blobId: BlobId): AppendResult {
-  const node = readTreeNode(store, pageId)
-  if (node.kind === 'leaf') {
-    const last = node.entries[node.entries.length - 1]
-    const maxOrder = last === undefined ? -1 : last.order
-    const nextOrder = maxOrder + 1
-    if (nextOrder <= maxOrder) {
-      throw new Error('tree order cannot advance within the safe number range; full renumber required')
+type LevelResult = readonly PageId[]
+
+/** Split one ordered entry array into leaf-sized chunks via recursive halving
+ * (matching the single-append split point: mid = ceil(length / 2)), so a
+ * single-entry batch produces exactly the two leaves the incremental path
+ * produced.
+ * @param store - page store to write leaves into.
+ * @param entries - strictly increasing entries to split.
+ * @returns the leaf pages, in order.
+ */
+function writeLeafChunks(store: PageStore, entries: readonly LeafEntry[]): LevelResult {
+  if (entries.length <= MAX_ENTRIES) {
+    return [writeLeafPage(store, entries)]
+  }
+  const mid = Math.ceil(entries.length / 2)
+  return [
+    ...writeLeafChunks(store, entries.slice(0, mid)),
+    ...writeLeafChunks(store, entries.slice(mid)),
+  ]
+}
+
+/** Append a batch of events to the rightmost leaf with one path traversal:
+ * read the root-to-rightmost-leaf page chain once, splice the whole batch
+ * into the rightmost leaf (splitting it into as many leaves as needed), then
+ * copy each level back up, pushing one key per extra sibling page. Writes
+ * O(depth + batchLeafPages) pages instead of one O(depth) path per event.
+ * Throws when the entry order cannot advance (the rightmost order is at the
+ * number ceiling); callers fall back to a full renumber.
+ * @param store - page store holding the tree.
+ * @param rootPage - current root page; may be an empty leaf page.
+ * @param events - the batch, appended in order.
+ * @returns the new root page.
+ */
+export function appendBatchToTree(store: PageStore, rootPage: PageId, events: readonly BatchEntry[]): PageId {
+  if (events.length === 0) return rootPage
+  // One downward pass: collect the page chain root -> ... -> rightmost leaf.
+  const path: PageId[] = [rootPage]
+  for (;;) {
+    const node = readTreeNode(store, path[path.length - 1]!)
+    if (node.kind === 'leaf') break
+    const lastChild = node.children[node.children.length - 1]
+    if (lastChild === undefined) throw new Error(`internal page ${path[path.length - 1]} must not be empty`)
+    path.push(lastChild)
+  }
+  const leafPage = path[path.length - 1]!
+  const leaf = readTreeNode(store, leafPage)
+  if (leaf.kind !== 'leaf') throw new Error('tree path ended at an internal page')
+  const last = leaf.entries[leaf.entries.length - 1]
+  const maxOrder = last === undefined ? -1 : last.order
+  if (maxOrder + events.length < maxOrder || !Number.isSafeInteger(maxOrder + events.length)) {
+    throw new Error('tree order cannot advance within the safe number range; full renumber required')
+  }
+  const appended: LeafEntry[] = []
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]!
+    appended.push({ order: maxOrder + 1 + index, eventId: event.eventId, blobId: event.blobId })
+  }
+  let result: LevelResult = writeLeafChunks(store, [...leaf.entries, ...appended])
+  // One upward pass: replace each level's rightmost child with the rewritten
+  // level below, pushing a key per extra sibling.
+  for (let level = path.length - 2; level >= 0; level -= 1) {
+    const node = readTreeNode(store, path[level]!)
+    if (node.kind !== 'internal') throw new Error(`tree path level ${level} is not internal`)
+    const children = [...node.children.slice(0, -1), ...result]
+    const keys = [...node.keys]
+    // result[0] keeps the replaced child's first order (its entries lead the
+    // new pages), so only siblings after the first add keys.
+    for (let index = 1; index < result.length; index += 1) {
+      keys.push(firstOrderOf(store, result[index]!))
     }
-    const entries = [...node.entries, { order: nextOrder, eventId, blobId }]
-    if (entries.length <= MAX_ENTRIES) return { rootPage: writeLeafPage(store, entries) }
-    const mid = Math.ceil(entries.length / 2)
-    return {
-      rootPage: writeLeafPage(store, entries.slice(0, mid)),
-      split: writeLeafPage(store, entries.slice(mid)),
+    if (keys.length <= MAX_KEYS) {
+      result = [writeInternalPage(store, keys, children)]
+    } else {
+      const mid = Math.ceil(keys.length / 2)
+      result = [
+        writeInternalPage(store, keys.slice(0, mid), children.slice(0, mid + 1)),
+        writeInternalPage(store, keys.slice(mid + 1), children.slice(mid + 1)),
+      ]
     }
   }
-  const lastChild = node.children[node.children.length - 1]
-  if (lastChild === undefined) throw new Error(`internal page ${pageId} must not be empty`)
-  const result = appendInto(store, lastChild, eventId, blobId)
-  const children = [...node.children]
-  children[children.length - 1] = result.rootPage
-  const keys = [...node.keys]
-  if (result.split !== undefined) {
-    children.push(result.split)
-    keys.push(firstOrderOf(store, result.split))
+  // The whole tree grew by `result` root siblings; a split root needs a new
+  // internal root over them, exactly like a single-append root split.
+  if (result.length === 1) return result[0]!
+  const keys = []
+  for (let index = 1; index < result.length; index += 1) {
+    keys.push(firstOrderOf(store, result[index]!))
   }
-  if (keys.length <= MAX_KEYS) return { rootPage: writeInternalPage(store, keys, children) }
-  const mid = Math.ceil(keys.length / 2)
-  return {
-    rootPage: writeInternalPage(store, keys.slice(0, mid), children.slice(0, mid + 1)),
-    split: writeInternalPage(store, keys.slice(mid + 1), children.slice(mid + 1)),
-  }
+  return writeInternalPage(store, keys, [...result])
 }
 
 /** Append one event to the rightmost leaf of a persisted B+Tree by copying
  * the rightmost path, and return the new root page. Writes O(depth) pages
- * instead of rewriting every node, so append stays O(log n) in the tree size;
- * a root split mints a new internal root. Throws when the entry order cannot
- * advance (see {@link appendInto}); callers fall back to a full renumber.
+ * instead of rewriting every node, so append stays O(log n) in the tree size.
+ * Delegates to the batched path with a single entry, so the two share one
+ * implementation. Throws when the entry order cannot advance (see
+ * {@link appendBatchToTree}); callers fall back to a full renumber.
  * @param store - page store holding the tree.
  * @param rootPage - current root page; may be an empty leaf page.
  * @param eventId - identity of the appended event.
@@ -335,8 +381,5 @@ function appendInto(store: PageStore, pageId: PageId, eventId: EventId, blobId: 
  * @returns the new root page.
  */
 export function appendEntryToTree(store: PageStore, rootPage: PageId, eventId: EventId, blobId: BlobId): PageId {
-  const result = appendInto(store, rootPage, eventId, blobId)
-  if (result.split === undefined) return result.rootPage
-  const keys = [firstOrderOf(store, result.split)]
-  return writeInternalPage(store, keys, [result.rootPage, result.split])
+  return appendBatchToTree(store, rootPage, [{ eventId, blobId }])
 }
